@@ -147,7 +147,100 @@ always @(posedge ext_mem_clk or posedge rst_all) begin
         frame_write_toggle_mem <= ~frame_write_toggle_mem;
 end
 
+// =========================================================================
+//  按键子系统（★ 新增）
+// -------------------------------------------------------------------------
+//  只有 2 个物理按键，通过"长短按 / 双击"复用控制 6 项功能。
+//  完整的按键映射表见 common/key_ctrl_fsm.v 文件头注释。
+//
+//  这个模块工作在 50MHz 的 clk 域，是本系统的"人机交互大脑"。
+// =========================================================================
+wire [7:0] cfg_period_sec;      // 轮播周期（秒）  → 送 sd_card_clk 域
+wire [4:0] cfg_brightness;      // 亮度 0..31      → 送 video_clk 域
+wire [4:0] cfg_contrast;        // 对比度 0..31    → 送 video_clk 域
+wire [1:0] cfg_trans_mode;      // 转场模式        → 送 video_clk 域
+wire [1:0] cfg_adj_sel;         // 当前调节项      → 送 video_clk 域
+wire       cfg_adj_mode;        // 运行/调节模式   → 送 video_clk 域
+wire       cfg_fade_en;         // 转场使能（由 trans_mode 派生）
+wire       key_next_pulse;      // 手动切下一张（单拍脉冲）
+wire       key_auto_pulse;      // 自动轮播开关翻转（单拍脉冲）
+
+key_ctrl_fsm #(
+    .CLK_FREQ_HZ (50_000_000)
+) u_key_ctrl_fsm (
+    .clk              (clk),
+    .rst              (rst_all),
+    .key1             (key1),
+    .key2             (key2),
+    .O_period_sec     (cfg_period_sec),
+    .O_brightness     (cfg_brightness),
+    .O_contrast       (cfg_contrast),
+    .O_trans_mode     (cfg_trans_mode),
+    .O_adj_sel        (cfg_adj_sel),
+    .O_adj_mode       (cfg_adj_mode),
+    .O_key_next_pulse (key_next_pulse),
+    .O_key_auto_pulse (key_auto_pulse),
+    .O_fade_en        (cfg_fade_en)
+);
+
+//--------------------------------------------------------------------------
+//  跨时钟域传输配置参数（原理见 common/cfg_cdc.v 的详细注释）
+//    ① cfg_period_sec  → sd_card_clk 域，给 sd_card_bmp 决定轮播周期
+//    ② 视频相关配置    → video_clk 域，给图像处理流水线 / OSD
+//
+//  ★ 视频域配置打包成一个 16bit 字一次性跨域，比逐个信号跨域简单可靠得多
+//--------------------------------------------------------------------------
+wire [7:0] cfg_period_sec_sd;
+
+cfg_cdc #(
+    .WIDTH (8)
+) u_cdc_period (
+    .I_clk_src (clk),
+    .I_rst_src (rst_all),
+    .I_data    (cfg_period_sec),
+    .I_clk_dst (sd_card_clk),
+    .I_rst_dst (rst_all),
+    .O_data    (cfg_period_sec_sd)
+);
+
+// 视频域配置字段分配：
+//   [15:11] 亮度   [10:6] 对比度   [5] 运行/调节模式
+//   [4:3]   调节项 [2:1]  转场模式  [0] 预留
+wire [15:0] cfg_video_src = {
+    cfg_brightness,      // [15:11]
+    cfg_contrast,        // [10:6]
+    cfg_adj_mode,        // [5]
+    cfg_adj_sel,         // [4:3]
+    cfg_trans_mode,      // [2:1]
+    1'b0                 // [0] 预留
+};
+
+wire [15:0] cfg_video;
+
+cfg_cdc #(
+    .WIDTH (16)
+) u_cdc_video (
+    .I_clk_src (clk),
+    .I_rst_src (rst_all),
+    .I_data    (cfg_video_src),
+    .I_clk_dst (video_clk),
+    .I_rst_dst (rst_all),
+    .O_data    (cfg_video)
+);
+
+wire [4:0] vcfg_brightness = cfg_video[15:11];
+wire [4:0] vcfg_contrast   = cfg_video[10:6];
+wire       vcfg_adj_mode   = cfg_video[5];
+wire [1:0] vcfg_adj_sel    = cfg_video[4:3];
+wire [1:0] vcfg_trans_mode = cfg_video[2:1];
+
 // ===================== TF 多图扫描与缓存（双缓冲） =====================
+// 新增的状态输出线（供 OSD / 转场使用）
+wire        load_busy_sd;         // 正在装载新图
+wire        auto_play_en_sd;      // 自动轮播开关状态
+wire [1:0]  img_idx_sd;           // 当前第几张
+wire [2:0]  img_found_count_sd;   // 共几张
+
 sd_card_bmp #(
     .CLK_FREQ_HZ       (100_000_000),
     .SCAN_START_SECTOR (32'd0),
@@ -156,12 +249,21 @@ sd_card_bmp #(
 ) sd_card_bmp_m0(
     .clk               (sd_card_clk),
     .rst               (rst_all),
-    .key_next          (key1),
-    .key_auto          (key2),
+    // ★ 注意：这里接的是按键子系统出来的"单拍脉冲"，
+    //   不能接原始按键电平（sd_card_bmp 内部的消抖已删除）
+    .key_next          (key_next_pulse),
+    .key_auto          (key_auto_pulse),
+    .I_period_sec      (cfg_period_sec_sd),   // ★ 轮播周期（可配置）
     .state_code        (state_code),
     .bmp_width         (16'd640),
     .bmp_height        (16'd480),
     .display_valid     (display_valid),
+
+    // ★ 新增状态输出
+    .O_load_busy       (load_busy_sd),
+    .O_auto_play_en    (auto_play_en_sd),
+    .O_img_idx         (img_idx_sd),
+    .O_img_found_count (img_found_count_sd),
 
     .write_finish_toggle(frame_write_toggle_mem),
     .write_buf_idx     (write_buf_idx),
@@ -177,9 +279,48 @@ sd_card_bmp #(
     .SD_MISO           (sd_miso)
 );
 
-seg_decoder seg_decoder_m0(
-    .bin_data          (state_code),
-    .seg_data          (seg_data_0)
+// =========================================================================
+//  数码管显示（★ 改造：由 seg_display 统一合成 6 位内容）
+// -------------------------------------------------------------------------
+//  显示版面见 SD/seg_display.v 的头部注释。这里只负责准备"要显示的数值"：
+//      RUN 模式    → 显示当前轮播周期（秒）
+//      ADJUST 模式 → 显示当前调节项的数值（亮度 / 对比度 / 周期）
+//
+//  ★ 注意：seg_scan 工作在 50MHz 的 clk 域，所以这里取用的配置参数
+//    必须也是 clk 域的信号（cfg_* 而不是 vcfg_*），避免跨时钟域采样。
+// =========================================================================
+wire [15:0] seg_value = cfg_adj_mode
+                      ? ((cfg_adj_sel == 2'd0) ? {11'd0, cfg_brightness} :
+                         (cfg_adj_sel == 2'd1) ? {11'd0, cfg_contrast}   :
+                                                  {8'd0,  cfg_period_sec})
+                      : {8'd0, cfg_period_sec};
+
+// auto_play_en 来自 sd_card_clk(100MHz) 域，这里打两拍同步到 clk 域再用
+reg auto_play_sync0, auto_play_sync1;
+always @(posedge clk or posedge rst_all) begin
+    if (rst_all) begin
+        auto_play_sync0 <= 1'b0;
+        auto_play_sync1 <= 1'b0;
+    end else begin
+        auto_play_sync0 <= auto_play_en_sd;
+        auto_play_sync1 <= auto_play_sync0;
+    end
+end
+
+wire [7:0] seg_d0, seg_d1, seg_d2, seg_d3, seg_d4, seg_d5;
+
+seg_display u_seg_display (
+    .I_state_code (state_code),
+    .I_adj_mode   (cfg_adj_mode),
+    .I_adj_sel    (cfg_adj_sel),
+    .I_auto_play  (auto_play_sync1),
+    .I_value      (seg_value),
+    .O_seg_0      (seg_d0),
+    .O_seg_1      (seg_d1),
+    .O_seg_2      (seg_d2),
+    .O_seg_3      (seg_d3),
+    .O_seg_4      (seg_d4),
+    .O_seg_5      (seg_d5)
 );
 
 seg_scan seg_scan_m0(
@@ -187,12 +328,12 @@ seg_scan seg_scan_m0(
     .rst_n             (rst_n),
     .seg_sel           (seg_sel),
     .seg_data          (seg_data),
-    .seg_data_0        ({1'b1,7'b1111_111}),
-    .seg_data_1        ({1'b1,7'b1111_111}),
-    .seg_data_2        ({1'b1,7'b1111_111}),
-    .seg_data_3        ({1'b1,7'b1111_111}),
-    .seg_data_4        ({1'b1,7'b1111_111}),
-    .seg_data_5        ({1'b1,seg_data_0})
+    .seg_data_0        (seg_d0),
+    .seg_data_1        (seg_d1),
+    .seg_data_2        (seg_d2),
+    .seg_data_3        (seg_d3),
+    .seg_data_4        (seg_d4),
+    .seg_data_5        (seg_d5)
 );
 
 // ===================== 原图像时序与帧缓存 =====================
@@ -221,7 +362,43 @@ video_delay video_delay_m0(
 );
 
 // 首图提交前黑屏；提交后一直显示当前显示缓冲区内容
-assign vout_data = display_valid ? vout_data_raw : 24'd0;
+wire [23:0] vout_base;
+assign vout_base = display_valid ? vout_data_raw : 24'd0;
+
+// =========================================================================
+//  图像处理流水线（第 1 级）：亮度 / 对比度实时调节
+// -------------------------------------------------------------------------
+//  数据流：vout_base → [image_processor] → vout_proc → vout_data → AXIS → HDMI
+//
+//  ★ 关键：image_processor 内部把像素延迟 2 拍，同时把 hs/vs/de 也延迟 2 拍。
+//    所以下游 video_rgb_to_axis_640x480 必须使用它输出的 de_proc / vs_proc，
+//    绝不能再接原来的 de / vs —— 否则同步信号与像素错位，画面会偏移或撕裂。
+//
+//  阶段 1a：先用中性参数 (16/16)，此时输出应严格等于输入，
+//           上板验证"画面与改造前逐像素一致"即说明流水线插入正确。
+//  阶段 1b：改接按键状态机来的 cfg_brightness / cfg_contrast。
+// =========================================================================
+wire [23:0] vout_proc;
+wire        hs_proc, vs_proc, de_proc;
+
+image_processor u_image_processor (
+    .video_clk    (video_clk),
+    .rst          (rst_all),
+    .I_de         (de),
+    .I_hs         (hs),
+    .I_vs         (vs),
+    .I_rgb        (vout_base),
+    .O_de         (de_proc),
+    .O_hs         (hs_proc),
+    .O_vs         (vs_proc),
+    .O_rgb        (vout_proc),
+    // ★ 参数来自按键子系统，经 cfg_cdc 跨到 video_clk 域
+    //   中性值 16/16 时输出等于输入（画面不变）
+    .I_brightness (vcfg_brightness),
+    .I_contrast   (vcfg_contrast)
+);
+
+assign vout_data = vout_proc;
 
 frame_read_write #(
     .WRITE_V_FLIP     (1),
@@ -323,11 +500,13 @@ audio_arc_calculate #(
 );
 
 // ===================== RGB/DE 转 AXIS 视频 =====================
+// ★ 注意：I_vs / I_de 必须接图像处理流水线输出后的 vs_proc / de_proc，
+//    它们与 vout_data 严格同拍；若接原始的 vs / de 会导致画面偏移或撕裂。
 video_rgb_to_axis_640x480 u_video_rgb_to_axis_640x480(
     .I_clk         (video_clk),
     .I_rst         (rst_all),
-    .I_vs          (vs),
-    .I_de          (de),
+    .I_vs          (vs_proc),
+    .I_de          (de_proc),
     .I_rgb         (vout_data),
     .O_video_user  (axis_s_user),
     .O_video_valid (axis_s_valid),
