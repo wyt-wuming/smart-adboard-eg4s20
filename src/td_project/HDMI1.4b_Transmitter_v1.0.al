@@ -298,7 +298,6 @@
                     <Attr Name="CompileOrder" Val="43"/>
                 </FileInfo>
             </File>
-            <!-- ===== 智能数字广告牌改造：新增模块 ===== -->
             <File Path="../user_source/hdl_source/video/video_sync_delay.v">
                 <FileInfo>
                     <Attr Name="UsedInSyn" Val="true"/>
