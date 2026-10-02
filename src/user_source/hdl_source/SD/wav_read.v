@@ -52,6 +52,7 @@ module wav_read #(
     // ---------------- PCM 输出（写音频 FIFO）----------------
     output reg         pcm_wr_en,              // 写使能（每帧一个脉冲）
     output reg  [31:0] pcm_data,               // {R[15:0], L[15:0]}
+    input  wire        I_fifo_full,            // ★ 音频 FIFO 满标志（保险：满了就丢帧，不写坏数据）
 
     output wire [3:0]  state_code              // 状态码（送数码管）
                                                // ★ 注意：必须用 wire 而不是 reg！
@@ -244,9 +245,14 @@ module wav_read #(
                             endcase
 
                             if (byte_in_frame == 2'd3) begin
-                                // 收满一帧：拼成 {R[15:0], L[15:0]} 写入 FIFO
-                                pcm_wr_en     <= 1'b1;
-                                pcm_data      <= {sd_sec_read_data, sample_buf[23:0]};
+                                // 收满一帧：拼成 {R[15:0], L[15:0]}
+                                // ★【保险】FIFO 满时直接丢弃这一帧。
+                                //   宁可丢一帧（听感上极轻微），
+                                //   也绝不能在满的时候写，否则可能破坏 FIFO 内部状态。
+                                if (!I_fifo_full) begin
+                                    pcm_wr_en <= 1'b1;
+                                    pcm_data  <= {sd_sec_read_data, sample_buf[23:0]};
+                                end
                                 byte_in_frame <= 2'd0;
                             end else begin
                                 byte_in_frame <= byte_in_frame + 2'd1;

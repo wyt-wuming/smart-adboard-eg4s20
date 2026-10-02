@@ -502,6 +502,7 @@ wav_read #(
     .sd_sec_read_end        (wav_sd_sec_read_end),
     .pcm_wr_en              (wav_pcm_wr_en),
     .pcm_data               (wav_pcm_data),
+    .I_fifo_full            (audio_fifo_full),   // ★ 保险：FIFO 满时 wav_read 丢帧不写
     .state_code             (wav_state_code)
 );
 
