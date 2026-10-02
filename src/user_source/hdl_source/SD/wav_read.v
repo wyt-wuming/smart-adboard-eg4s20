@@ -53,7 +53,10 @@ module wav_read #(
     output reg         pcm_wr_en,              // 写使能（每帧一个脉冲）
     output reg  [31:0] pcm_data,               // {R[15:0], L[15:0]}
 
-    output reg  [3:0]  state_code              // 状态码（送数码管）
+    output wire [3:0]  state_code              // 状态码（送数码管）
+                                               // ★ 注意：必须用 wire 而不是 reg！
+                                               //   因为它是由 assign 连续赋值的，
+                                               //   而 reg 只能用 always 块赋值。
 );
 
     //--------------------------------------------------------------------------
