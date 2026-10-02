@@ -58,3 +58,10 @@ set_pin_assignment	{ seg_sel[5] }	{ LOCATION = D11; IOSTANDARD = LVCMOS33; DRIVE
 
 
 
+
+# ===== 智能数字广告牌改造：新增 4 个拨码开关 =====
+# 网络名 SWKEY_1~4，来自 HX4S20C 原理图（与 120 欧电阻 RN38 串联后进 FPGA）
+set_pin_assignment	{ sw1 }	{ LOCATION = C8; IOSTANDARD = LVCMOS33; PULLTYPE = NONE; }
+set_pin_assignment	{ sw2 }	{ LOCATION = C7; IOSTANDARD = LVCMOS33; PULLTYPE = NONE; }
+set_pin_assignment	{ sw3 }	{ LOCATION = C6; IOSTANDARD = LVCMOS33; PULLTYPE = NONE; }
+set_pin_assignment	{ sw4 }	{ LOCATION = C5; IOSTANDARD = LVCMOS33; PULLTYPE = NONE; }

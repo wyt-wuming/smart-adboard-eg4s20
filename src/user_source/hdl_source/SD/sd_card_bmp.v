@@ -26,7 +26,7 @@ module sd_card_bmp #(
     input                       clk,              // sd_card_clk = 100MHz
     input                       rst,              // 高有效复位
     input                       key_next,         // ★ 手动切下一张（单拍脉冲，勿再消抖）
-    input                       key_auto,         // ★ 自动轮播开关翻转（单拍脉冲，勿再消抖）
+    input                       auto_play_ext,    // ★【改】自动轮播开关（电平），来自拨码开关 SW2
     input  [7:0]                I_period_sec,     // ★【新增】轮播周期（秒），来自 key_ctrl_fsm
     output [3:0]                state_code,       // bmp_read 状态码（送数码管）
     input  [15:0]               bmp_width,
@@ -54,7 +54,6 @@ module sd_card_bmp #(
 );
 
 wire key_next_press;
-wire key_auto_press;
 
 wire             sd_sec_read;
 wire [31:0]      sd_sec_read_addr;
@@ -75,7 +74,9 @@ reg              load_start_pulse;
 reg [31:0]       load_sector;
 reg              scan_kicked;
 reg              first_image_committed;
-reg              auto_play_en;
+// ★【改造】自动轮播开关改成"外部电平"：由拨码开关 SW2 直接控制，
+//   不再是内部按键翻转，所以用 wire 而不是 reg
+wire             auto_play_en = auto_play_ext;
 // ★【改造】轮播周期计数：改成"1 秒节拍 + 秒计数器"
 //   原实现是 reg [31:0] auto_cnt + 与 CLK_FREQ_HZ-1 比较（写死 1 秒）。
 //   改成秒计数器后：① 周期可通过 I_period_sec 配置 ② 最长 30 秒也不会溢出
@@ -142,7 +143,6 @@ assign write_finish_pulse = wrfin_tgl_sync[2] ^ wrfin_tgl_sync[1];
 //     这是本次改造中最隐蔽、最容易踩的坑，务必保留此注释。
 //--------------------------------------------------------------------------
 assign key_next_press = key_next;
-assign key_auto_press = key_auto;
 
 function [1:0] next_index_limited;
     input [1:0] cur;
@@ -192,7 +192,6 @@ always @(posedge clk or posedge rst) begin
         load_sector           <= 32'd0;
         scan_kicked           <= 1'b0;
         first_image_committed <= 1'b0;
-        auto_play_en          <= 1'b0;
         auto_sec_cnt          <= 16'd0;
         img_found_count       <= 3'd0;
         img_idx               <= 2'd0;
@@ -216,7 +215,6 @@ always @(posedge clk or posedge rst) begin
         if (!sd_init_done) begin
             scan_kicked           <= 1'b0;
             first_image_committed <= 1'b0;
-            auto_play_en          <= 1'b0;
             auto_sec_cnt          <= 16'd0;
             img_found_count       <= 3'd0;
             img_idx               <= 2'd0;
@@ -259,13 +257,8 @@ always @(posedge clk or posedge rst) begin
                 img_idx               <= load_idx;
                 display_valid         <= 1'b1;
                 first_image_committed <= 1'b1;
-
-                // ★【改造】首图显示成功后自动开启轮播：
-                //   实现"插电即自动播放"的广告牌体验，评委演示时无需任何操作。
-                //   原例程需要手动按一下 key2 才轮播，观感上不像"广告牌"。
-                //   （至少要有 2 张图，否则无从轮播）
-                if (img_found_count > 3'd1)
-                    auto_play_en <= 1'b1;
+                // ★【改】自动轮播现在完全由拨码开关 SW2 控制（外部电平），
+                //   所以这里不再自动开启，也不需要按键翻转逻辑。
             end
 
             // 上电后自动发起一次“扫描前 4 张 BMP”
@@ -273,7 +266,6 @@ always @(posedge clk or posedge rst) begin
                 scan_start_pulse      <= 1'b1;
                 scan_kicked           <= 1'b1;
                 first_image_committed <= 1'b0;
-                auto_play_en          <= 1'b0;
                 auto_sec_cnt          <= 16'd0;
                 img_found_count       <= 3'd0;
                 img_idx               <= 2'd0;
@@ -290,11 +282,11 @@ always @(posedge clk or posedge rst) begin
                 if (key_next_press && scan_done && (img_found_count > 3'd0))
                     next_req_pending <= 1'b1;
 
-                // 自动播放开/关
-                if (key_auto_press && scan_done && (img_found_count > 3'd1)) begin
-                    auto_play_en <= ~auto_play_en;
-                    auto_sec_cnt <= 16'd0;
-                end
+                // ★【改】自动轮播开关现在由拨码开关 SW2 直接控制（电平信号），
+                //   不再需要"按键翻转"逻辑。
+                //   注意：下面自动计时条件里包含 auto_play_en，
+                //   所以拨到 OFF 时 auto_sec_cnt 会被清零；
+                //   再拨回 ON 时计时从 0 重新开始，行为符合直觉。
 
                 // 自动播放 1s 计数：只有当前没有写图任务时才计时
                 if (scan_done && auto_play_en && display_valid && !load_busy && first_image_committed && (img_found_count > 3'd1)) begin

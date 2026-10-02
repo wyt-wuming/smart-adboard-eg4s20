@@ -2,8 +2,18 @@
 module top(
     input                       clk,
     input                       rst_n,
-    input                       key1,           // 手动下一张
-    input                       key2,           // 自动播放 开/关
+    input                       key1,           // 按键 KEY_2（引脚 B2）
+    input                       key2,           // 按键 KEY_4（引脚 C1）
+
+    // ---- ★【新增】4 个拨码开关（引脚从 HX4S20C 原理图查得）----
+    //   SW1 → C8 ：工作模式 / 调节模式
+    //   SW2 → C7 ：自动轮播 / 固定
+    //   SW3 → C6 ：淡入淡出转场 / 硬切
+    //   SW4 → C5 ：显示 OSD / 隐藏 OSD
+    input                       sw1,
+    input                       sw2,
+    input                       sw3,
+    input                       sw4,
 
     output [5:0]                seg_sel,
     output [7:0]                seg_data,
@@ -148,39 +158,73 @@ always @(posedge ext_mem_clk or posedge rst_all) begin
 end
 
 // =========================================================================
-//  按键子系统（★ 新增）
+//  人机交互子系统（★ 拨码开关版）
 // -------------------------------------------------------------------------
-//  只有 2 个物理按键，通过"长短按 / 双击"复用控制 6 项功能。
-//  完整的按键映射表见 common/key_ctrl_fsm.v 文件头注释。
+//  4 个拨码开关 + 2 个按键。完整操作表见 common/key_ctrl_fsm.v 文件头注释。
+//
+//  拨码开关引脚（从 HX4S20C 原理图查得）：
+//      SW1 → C8（工作/调节模式）   SW2 → C7（自动轮播/固定）
+//      SW3 → C6（转场开关）        SW4 → C5（OSD 开关）
 //
 //  这个模块工作在 50MHz 的 clk 域，是本系统的"人机交互大脑"。
 // =========================================================================
+
+//--------------------------------------------------------------------------
+// 拨码开关输入同步（2 级触发器防亚稳态）
+//   拨码开关是机械触点，拨动瞬间会有抖动。
+//   但开关只决定"模式"、不产生事件，即使抖动导致状态瞬间跳变，
+//   用户也看不出来，所以只做 2 级同步即可，不需要 20ms 消抖计数器。
+//--------------------------------------------------------------------------
+reg sw1_sync0, sw1_sync1;
+reg sw2_sync0, sw2_sync1;
+reg sw3_sync0, sw3_sync1;
+reg sw4_sync0, sw4_sync1;
+
+always @(posedge clk or posedge rst_all) begin
+    if (rst_all) begin
+        sw1_sync0 <= 1'b0;  sw1_sync1 <= 1'b0;
+        sw2_sync0 <= 1'b0;  sw2_sync1 <= 1'b0;
+        sw3_sync0 <= 1'b0;  sw3_sync1 <= 1'b0;
+        sw4_sync0 <= 1'b0;  sw4_sync1 <= 1'b0;
+    end else begin
+        sw1_sync0 <= sw1;   sw1_sync1 <= sw1_sync0;
+        sw2_sync0 <= sw2;   sw2_sync1 <= sw2_sync0;
+        sw3_sync0 <= sw3;   sw3_sync1 <= sw3_sync0;
+        sw4_sync0 <= sw4;   sw4_sync1 <= sw4_sync0;
+    end
+end
+
 wire [7:0] cfg_period_sec;      // 轮播周期（秒）  → 送 sd_card_clk 域
 wire [4:0] cfg_brightness;      // 亮度 0..31      → 送 video_clk 域
 wire [4:0] cfg_contrast;        // 对比度 0..31    → 送 video_clk 域
-wire [1:0] cfg_trans_mode;      // 转场模式        → 送 video_clk 域
-wire [1:0] cfg_adj_sel;         // 当前调节项      → 送 video_clk 域
 wire       cfg_adj_mode;        // 运行/调节模式   → 送 video_clk 域
-wire       cfg_fade_en;         // 转场使能（由 trans_mode 派生）
+wire [1:0] cfg_adj_sel;         // 当前调节项      → 送 video_clk 域
+wire       cfg_fade_en;         // 转场使能        → 送 video_clk 域
+wire       cfg_osd_en;          // OSD 使能        → 送 video_clk 域
+wire       cfg_auto_play;       // 自动轮播开关    → 送 sd_card_clk 域
 wire       key_next_pulse;      // 手动切下一张（单拍脉冲）
-wire       key_auto_pulse;      // 自动轮播开关翻转（单拍脉冲）
 
 key_ctrl_fsm #(
-    .CLK_FREQ_HZ (50_000_000)
+    .CLK_FREQ_HZ    (50_000_000),
+    .SW_ACTIVE_HIGH (1'b1)      // ★ 拨码开关有效电平：拨到 ON 时读高（若方向反了改这里）
 ) u_key_ctrl_fsm (
     .clk              (clk),
     .rst              (rst_all),
     .key1             (key1),
     .key2             (key2),
+    .sw_mode          (sw1_sync1),
+    .sw_auto          (sw2_sync1),
+    .sw_trans         (sw3_sync1),
+    .sw_osd           (sw4_sync1),
     .O_period_sec     (cfg_period_sec),
     .O_brightness     (cfg_brightness),
     .O_contrast       (cfg_contrast),
-    .O_trans_mode     (cfg_trans_mode),
     .O_adj_sel        (cfg_adj_sel),
-    .O_adj_mode       (cfg_adj_mode),
     .O_key_next_pulse (key_next_pulse),
-    .O_key_auto_pulse (key_auto_pulse),
-    .O_fade_en        (cfg_fade_en)
+    .O_adj_mode       (cfg_adj_mode),
+    .O_auto_play      (cfg_auto_play),
+    .O_fade_en        (cfg_fade_en),
+    .O_osd_en         (cfg_osd_en)
 );
 
 //--------------------------------------------------------------------------
@@ -205,14 +249,15 @@ cfg_cdc #(
 
 // 视频域配置字段分配：
 //   [15:11] 亮度   [10:6] 对比度   [5] 运行/调节模式
-//   [4:3]   调节项 [2:1]  转场模式  [0] 预留
+//   [4:3]   调节项 [2]    转场开关 [1] OSD 开关   [0] 预留
 wire [15:0] cfg_video_src = {
     cfg_brightness,      // [15:11]
     cfg_contrast,        // [10:6]
     cfg_adj_mode,        // [5]
     cfg_adj_sel,         // [4:3]
-    cfg_trans_mode,      // [2:1]
-    1'b0                 // [0] 预留
+    cfg_fade_en,         // [2]   转场开关（SW3）
+    cfg_osd_en,          // [1]   OSD 开关（SW4）
+    1'b0                 // [0]   预留
 };
 
 wire [15:0] cfg_video;
@@ -232,7 +277,25 @@ wire [4:0] vcfg_brightness = cfg_video[15:11];
 wire [4:0] vcfg_contrast   = cfg_video[10:6];
 wire       vcfg_adj_mode   = cfg_video[5];
 wire [1:0] vcfg_adj_sel    = cfg_video[4:3];
-wire [1:0] vcfg_trans_mode = cfg_video[2:1];
+wire       vcfg_fade_en    = cfg_video[2];   // 转场开关（阶段 3 使用）
+wire       vcfg_osd_en     = cfg_video[1];   // OSD 开关（阶段 1e 使用）
+
+//--------------------------------------------------------------------------
+// 自动轮播开关（SW2）也要跨到 sd_card_clk(100MHz) 域，给 sd_card_bmp 用
+//   1bit 电平信号，用 cfg_cdc 的 toggle 握手方式跨域最稳妥
+//--------------------------------------------------------------------------
+wire cfg_auto_play_sd;
+
+cfg_cdc #(
+    .WIDTH (1)
+) u_cdc_auto (
+    .I_clk_src (clk),
+    .I_rst_src (rst_all),
+    .I_data    (cfg_auto_play),
+    .I_clk_dst (sd_card_clk),
+    .I_rst_dst (rst_all),
+    .O_data    (cfg_auto_play_sd)
+);
 
 // ===================== TF 多图扫描与缓存（双缓冲） =====================
 // 新增的状态输出线（供 OSD / 转场使用）
@@ -252,7 +315,7 @@ sd_card_bmp #(
     // ★ 注意：这里接的是按键子系统出来的"单拍脉冲"，
     //   不能接原始按键电平（sd_card_bmp 内部的消抖已删除）
     .key_next          (key_next_pulse),
-    .key_auto          (key_auto_pulse),
+    .auto_play_ext     (cfg_auto_play_sd),    // ★ 自动轮播开关（拨码开关 SW2，电平信号）
     .I_period_sec      (cfg_period_sec_sd),   // ★ 轮播周期（可配置）
     .state_code        (state_code),
     .bmp_width         (16'd640),
