@@ -1,4 +1,4 @@
 LAPTOP-16TVSK7Q
 wys
-6200
+31560
 E:\project qianrushi\anlu\lab_ex5_i2s\src\td_project\.lock.f

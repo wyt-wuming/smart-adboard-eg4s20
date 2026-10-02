@@ -208,7 +208,15 @@ module wav_read #(
                         // ---- 全部合格，准备播放 ----
                         data_offset       <= 32'd44;                 // 标准头长度
                         data_size         <= {hdr[43], hdr[42], hdr[41], hdr[40]};
-                        data_start_sector <= 32'd0;                  // 44/512 = 0 号扇区
+                        // ★【修复】这里原来写死 32'd0，是错的！
+                        //   WAV 文件在卡上的位置不一定是 0 号扇区（前面可能还有
+                        //   4 张 BMP 图片占了扇区）。如果写死 0，播完一遍后
+                        //   "循环回绕"会跳回 0 号扇区去读图片数据 →
+                        //   听到的就是"滋滋"噪音。
+                        //   正确做法：用扫描时记录下来的"文件起始扇区"。
+                        data_start_sector <= scan_found_sector;
+                        // 从文件起始扇区开始顺序读
+                        sd_sec_read_addr  <= scan_found_sector;
                         file_byte_cnt     <= 32'd0;
                         byte_in_frame     <= 2'd0;
                         wav_err_code      <= E_OK;
