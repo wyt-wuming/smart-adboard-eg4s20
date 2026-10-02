@@ -93,13 +93,13 @@ wire de_0;
 
 // HDMI 1.4b 音频发射相关
 wire        audio_pll_lock;
-wire        audio_mclk;
-wire        audio_i2s_bclk;
-wire        audio_i2s_lrck;
-wire        audio_i2s_dout;
-wire        audio_valid;
-wire [23:0] audio_left_data;
-wire [23:0] audio_right_data;
+wire        audio_mclk;      // 音频 PLL 输出的 12.288MHz
+// ★【改造】原 I2S 测试音相关信号(audio_i2s_bclk/lrck/dout)和
+//   解串后的 audio_valid/audio_left_data/audio_right_data 已全部删除。
+//   音频数据现在来自 TF 卡（见下方"音频子系统"）。
+//   注意：audio_mclk 虽然不再参与音频通路，但仍需保留一个"消费者"，
+//   否则综合工具会把这个 PLL 优化掉，进而让 audio_pll_lock 变成常量、
+//   影响 rst_all 复位逻辑（见下面的 audio_clk_alive 计数器）。
 wire        acr_valid;
 wire [19:0] acr_cts;
 wire [19:0] acr_n;
@@ -139,7 +139,7 @@ video_pll video_pll_m0(
     .reset      (1'b0)
 );
 
-// 复用你 I2S->HDMI 工程里的 PLL，只取 12.288MHz 音频主时钟
+// 复用 I2S->HDMI 工程里的 PLL，只取 12.288MHz 音频主时钟
 PLL_HDMI_AUDIO u_audio_pll(
     .refclk     (clk),
     .reset      (1'b0),
@@ -148,6 +148,23 @@ PLL_HDMI_AUDIO u_audio_pll(
     .clk1_out   (),
     .clk2_out   (audio_mclk)
 );
+
+//--------------------------------------------------------------------------
+// ★ 音频 PLL 的"存活负载"
+//   audio_mclk 现在不参与音频通路了，如果没有任何负载，
+//   综合工具会认为这个 PLL 没用而把它优化掉，
+//   那样 audio_pll_lock 就变成常量，rst_all 的复位逻辑会失效。
+//   这里放一个最简计数器当"消费者"，代价很小，但能保住 PLL 正常工作。
+//   计数器的最高位同时可以当"音频 PLL 已锁定"的指示灯用。
+//--------------------------------------------------------------------------
+reg [15:0] audio_clk_alive;
+
+always @(posedge audio_mclk or posedge rst_all) begin
+    if (rst_all)
+        audio_clk_alive <= 16'd0;
+    else
+        audio_clk_alive <= audio_clk_alive + 16'd1;
+end
 
 // mem_clk 域把 write_finish 单拍转成 toggle，供 sd_card_clk 域可靠同步
 always @(posedge ext_mem_clk or posedge rst_all) begin
@@ -336,10 +353,217 @@ sd_card_bmp #(
     .write_req_ack     (sd_card_write_req_ack),
     .write_en          (sd_card_write_en),
     .write_data        (sd_card_write_data),
-    .SD_nCS            (sd_ncs),
-    .SD_DCLK           (sd_dclk),
-    .SD_MOSI           (sd_mosi),
-    .SD_MISO           (sd_miso)
+
+    // ★【改造】SD 总线改为从顶层接入（图片和音频共用，由仲裁器分配）
+    .sd_init_done           (sd_init_done_bus),
+    .sd_sec_read            (bmp_sd_sec_read),
+    .sd_sec_read_addr       (bmp_sd_sec_read_addr),
+    .sd_sec_read_data       (bmp_sd_sec_read_data),
+    .sd_sec_read_data_valid (bmp_sd_sec_read_dv),
+    .sd_sec_read_end        (bmp_sd_sec_read_end)
+);
+
+// =========================================================================
+//  ★【新增】音频子系统：从 TF 卡读 WAV 音乐，经 HDMI 输出
+// -------------------------------------------------------------------------
+//  数据流：
+//
+//     TF卡 ── sd_card_top（唯一实例，提到顶层）
+//                   │
+//              sd_bus_arbiter（扇区级仲裁，音频优先）
+//                   │
+//          ┌────────┴────────┐
+//      BMP通道             WAV通道
+//          │                 │
+//    sd_card_bmp         wav_read（扫描+解析+流式PCM）
+//    （读图片，原有）            │
+//                         音频FIFO（100MHz写 / 25MHz读）
+//                              │
+//                         audio_player（48kHz节拍）
+//                              │
+//                        HDMI 1.4b 发射核音频口
+//
+//  原本的"内部方波测试音"(hdmi_audio_tone_i2s_64fs + I2S_receiver)已移除 ——
+//  这也是合规要求："音频处理方法不能和参考例程相同"。
+// =========================================================================
+
+// ---- 仲裁器对外接口线（连到 sd_card_top）----
+wire        sd_bus_sec_read;
+wire [31:0] sd_bus_sec_read_addr;
+wire [7:0]  sd_bus_sec_read_data;
+wire        sd_bus_sec_read_dv;
+wire        sd_bus_sec_read_end;
+
+// ---- BMP 通道线（仲裁器 <-> sd_card_bmp）----
+wire        bmp_sd_sec_read;
+wire [31:0] bmp_sd_sec_read_addr;
+wire [7:0]  bmp_sd_sec_read_data;
+wire        bmp_sd_sec_read_dv;
+wire        bmp_sd_sec_read_end;
+
+// ---- WAV 通道线（仲裁器 <-> wav_read）----
+wire        wav_sd_sec_read;
+wire [31:0] wav_sd_sec_read_addr;
+wire [7:0]  wav_sd_sec_read_data;
+wire        wav_sd_sec_read_dv;
+wire        wav_sd_sec_read_end;
+
+// ---- 音频 FIFO 线 ----
+wire [31:0] audio_fifo_dout;
+wire        audio_fifo_empty;
+wire        audio_fifo_full;
+wire [8:0]  audio_fifo_wrusedw;   // 512 深 → 水位计数 9 位（与该 IP 输出位宽一致）
+wire        audio_fifo_re;
+
+// ---- SD 卡控制器（唯一实例）----
+wire        sd_init_done_bus;
+
+sd_card_top #(
+    .SPI_LOW_SPEED_DIV  (248),
+    .SPI_HIGH_SPEED_DIV (0)          // 0 → 25MHz；某些卡不稳时可改 2 (12.5MHz)
+) u_sd_card_top (
+    .clk                    (sd_card_clk),
+    .rst                    (rst_all),
+    .SD_nCS                 (sd_ncs),
+    .SD_DCLK                (sd_dclk),
+    .SD_MOSI                (sd_mosi),
+    .SD_MISO                (sd_miso),
+    .sd_init_done           (sd_init_done_bus),
+    .sd_sec_read            (sd_bus_sec_read),
+    .sd_sec_read_addr       (sd_bus_sec_read_addr),
+    .sd_sec_read_data       (sd_bus_sec_read_data),
+    .sd_sec_read_data_valid (sd_bus_sec_read_dv),
+    .sd_sec_read_end        (sd_bus_sec_read_end),
+    .sd_sec_write           (1'b0),
+    .sd_sec_write_addr      (32'd0),
+    .sd_sec_write_data      (),
+    .sd_sec_write_data_req  (),
+    .sd_sec_write_end       ()
+);
+
+// ---- WAV 扫描启动脉冲（等 SD 卡初始化完成后延迟一小段再扫描）----
+reg  [21:0] wav_scan_dly;
+reg         wav_scan_start;
+
+always @(posedge sd_card_clk or posedge rst_all) begin
+    if (rst_all) begin
+        wav_scan_dly   <= 22'd0;
+        wav_scan_start <= 1'b0;
+    end else begin
+        wav_scan_start <= 1'b0;
+        if (sd_init_done_bus) begin
+            if (wav_scan_dly < 22'h3F_FFFF)
+                wav_scan_dly <= wav_scan_dly + 22'd1;
+            else if (wav_scan_dly == 22'h3F_FFFF) begin
+                wav_scan_start <= 1'b1;         // 单拍脉冲，启动 WAV 扫描
+                wav_scan_dly   <= 22'h3F_FFFF + 22'd1;
+            end
+        end
+    end
+end
+
+// ---- WAV 扫描/读取模块 ----
+wire        wav_scan_done;
+wire        wav_scan_found;
+wire [31:0] wav_found_sector;
+wire [3:0]  wav_err_code;
+wire [3:0]  wav_state_code;
+wire        wav_pcm_wr_en;
+wire [31:0] wav_pcm_data;
+
+wav_read #(
+    .START_SECTOR (32'd0)
+) u_wav_read (
+    .clk                    (sd_card_clk),
+    .rst                    (rst_all),
+    .scan_start             (wav_scan_start),
+    .scan_max_sector        (32'd131071),
+    .scan_done              (wav_scan_done),
+    .scan_found             (wav_scan_found),
+    .scan_found_sector      (wav_found_sector),
+    .wav_err_code           (wav_err_code),
+    .play_en                (1'b1),              // 找到后持续播放（数据读完自动循环）
+    .sd_sec_read            (wav_sd_sec_read),
+    .sd_sec_read_addr       (wav_sd_sec_read_addr),
+    .sd_sec_read_data       (wav_sd_sec_read_data),
+    .sd_sec_read_data_valid (wav_sd_sec_read_dv),
+    .sd_sec_read_end        (wav_sd_sec_read_end),
+    .pcm_wr_en              (wav_pcm_wr_en),
+    .pcm_data               (wav_pcm_data),
+    .state_code             (wav_state_code)
+);
+
+// ---- SD 总线仲裁器 ----
+sd_bus_arbiter u_sd_bus_arbiter (
+    .clk                     (sd_card_clk),
+    .rst                     (rst_all),
+    .sd_sec_read             (sd_bus_sec_read),
+    .sd_sec_read_addr        (sd_bus_sec_read_addr),
+    .sd_sec_read_data        (sd_bus_sec_read_data),
+    .sd_sec_read_data_valid  (sd_bus_sec_read_dv),
+    .sd_sec_read_end         (sd_bus_sec_read_end),
+    .bmp_sec_read            (bmp_sd_sec_read),
+    .bmp_sec_read_addr       (bmp_sd_sec_read_addr),
+    .bmp_sec_read_data       (bmp_sd_sec_read_data),
+    .bmp_sec_read_data_valid (bmp_sd_sec_read_dv),
+    .bmp_sec_read_end        (bmp_sd_sec_read_end),
+    .wav_sec_read            (wav_sd_sec_read),
+    .wav_sec_read_addr       (wav_sd_sec_read_addr),
+    .wav_sec_read_data       (wav_sd_sec_read_data),
+    .wav_sec_read_data_valid (wav_sd_sec_read_dv),
+    .wav_sec_read_end        (wav_sd_sec_read_end),
+    .wav_fifo_wrusedw        (audio_fifo_wrusedw),
+    .O_grant_bmp             (),
+    .O_grant_wav             ()
+);
+
+// ---- 音频异步 FIFO ----
+//   直接复用工程里已有的 512 深 x 32bit 异步 FIFO（模块名 rfifo_32_32_512，
+//   定义在 IP/afifo_32_16_256.v 里），不需要另外生成 IP。
+//   写侧 sd_card_clk(100MHz)，读侧 video_clk(25MHz)，FWFT 语义。
+rfifo_32_32_512 #(
+    // ★ 关键参数：SHOW_AHEAD_EN = 1 打开"首字直通(FWFT)"模式
+    //   该 IP 默认是 1'b0（非 FWFT）：那种模式下 dout 要等 re 拉高一拍后才有效。
+    //   而 audio_player 是按 FWFT 语义写的（empty=0 时 dout 就是队首数据），
+    //   所以这里必须显式打开，两边语义才匹配。
+    .SHOW_AHEAD_EN (1'b1)
+) u_audio_fifo (
+    .rst        (rst_all),
+    .clkw       (sd_card_clk),
+    .clkr       (video_clk),
+    .we         (wav_pcm_wr_en),
+    .di         (wav_pcm_data),
+    .re         (audio_fifo_re),
+    .dout       (audio_fifo_dout),
+    .valid      (),
+    .full_flag  (audio_fifo_full),
+    .empty_flag (audio_fifo_empty),
+    .wrusedw    (audio_fifo_wrusedw),
+    .rdusedw    ()
+);
+
+// ---- 音频播放器（video_clk 域）----
+wire        aud_valid;
+wire [23:0] aud_left;
+wire [23:0] aud_right;
+wire [15:0] aud_underrun;
+wire [15:0] aud_frame_cnt;
+
+audio_player #(
+    .CLK_FREQ_HZ    (25_000_000),
+    .SAMPLE_RATE_HZ (48_000)
+) u_audio_player (
+    .video_clk          (video_clk),
+    .rst                (rst_all),
+    .I_fifo_dout        (audio_fifo_dout),
+    .I_fifo_empty       (audio_fifo_empty),
+    .O_fifo_re          (audio_fifo_re),
+    .O_audio_valid      (aud_valid),
+    .O_audio_left_data  (aud_left),
+    .O_audio_right_data (aud_right),
+    .I_gain             (8'd255),           // 原音量（阶段3 接入淡入淡出联动）
+    .O_underrun_cnt     (aud_underrun),
+    .O_frame_cnt        (aud_frame_cnt)
 );
 
 // =========================================================================
@@ -528,35 +752,21 @@ sdram U3(
     .Sdr_rd_dout       (Sdr_rd_dout)
 );
 
-// ===================== 音频：内部 I2S 测试音 =====================
-hdmi_audio_tone_i2s_64fs #(
-    .PHASE_INC (32'd39370534),
-    .AMP       (24'sd2000000)
-) u_hdmi_audio_tone_i2s_64fs (
-    .I_mclk      (audio_mclk),
-    .I_rst       (rst_all),
-    .O_i2s_BCLK  (audio_i2s_bclk),
-    .O_i2s_LRCK  (audio_i2s_lrck),
-    .O_i2s_DOUT  (audio_i2s_dout)
-);
-
-I2S_receiver u_I2S_receiver(
-    .I_clk              (video_clk),
-    .I_rst              (rst_all),
-    .I_i2s_BCLK         (audio_i2s_bclk),
-    .I_i2s_LRCK         (audio_i2s_lrck),
-    .I_i2s_DOUT         (audio_i2s_dout),
-    .O_audio_valid      (audio_valid),
-    .O_audio_left_data  (audio_left_data),
-    .O_audio_right_data (audio_right_data)
-);
-
+// ===================== 音频 ACR 参数计算 =====================
+//  原例程在这里是"内部 I2S 测试音(hdmi_audio_tone_i2s_64fs) +
+//  I2S 接收解串(I2S_receiver)"，现在音频数据来自 TF 卡（见上方音频子系统），
+//  这两个模块已删除，I_audio_valid 直接接 audio_player 的输出。
+//
+//  ACR (Audio Clock Regeneration) 的作用：
+//    HDMI 接收端没有独立的音频时钟线，靠发送端在音频数据包里携带
+//    CTS/N 两个参数来恢复采样时钟。N=6144 是 48kHz 的标准值；
+//    CTS 由本模块根据实际 valid 速率动态测量，可自动跟踪微小频差。
 audio_arc_calculate #(
     .ACR_N         (6144)
 ) u_audio_arc_calculate (
     .I_clk         (video_clk),
     .I_rst         (rst_all),
-    .I_audio_valid (audio_valid),
+    .I_audio_valid (aud_valid),          // ★ 改接音频播放器的 valid
     .O_acr_valid   (acr_valid),
     .O_acr_cts     (acr_cts),
     .O_acr_n       (acr_n)
@@ -617,9 +827,10 @@ hdmi_1_4b_transmitter_core_wrapper #(
     .I_axis_s_data      (axis_s_data),
     .O_axis_s_ready     (axis_s_ready),
 
-    .I_audio_valid      (audio_valid),
-    .I_audio_left_data  (audio_left_data),
-    .I_audio_right_data (audio_right_data),
+    // ★【改造】音频数据来自 TF 卡（audio_player），不再是内部测试音
+    .I_audio_valid      (aud_valid),
+    .I_audio_left_data  (aud_left),
+    .I_audio_right_data (aud_right),
     .I_acr_valid        (acr_valid),
     .I_acr_cts          (acr_cts),
     .I_acr_n            (acr_n),

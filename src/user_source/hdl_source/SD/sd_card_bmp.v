@@ -47,22 +47,24 @@ module sd_card_bmp #(
     input                       write_req_ack,
     output                      write_en,
     output [31:0]               write_data,
-    output                      SD_nCS,
-    output                      SD_DCLK,
-    output                      SD_MOSI,
-    input                       SD_MISO
+
+    // ---- ★【改造】SD 卡总线改为从外部接入（sd_card_top 提到顶层）----
+    //   原因：图片读取和音频读取要共用同一条 SPI 总线，
+    //         所以 sd_card_top 必须在顶层只例化一份，由 sd_bus_arbiter 分配使用权。
+    //   本模块从此不再直接驱动 SD 引脚。
+    input                       sd_init_done,          // SD 卡初始化完成
+    output                      sd_sec_read,           // 请求读一个扇区
+    output [31:0]               sd_sec_read_addr,      // 要读的扇区地址
+    input  [7:0]                sd_sec_read_data,      // 读回的字节
+    input                       sd_sec_read_data_valid,
+    input                       sd_sec_read_end        // 一个扇区读完（单拍）
 );
 
 wire key_next_press;
 
-wire             sd_sec_read;
-wire [31:0]      sd_sec_read_addr;
-wire [7:0]       sd_sec_read_data;
-wire             sd_sec_read_data_valid;
-wire             sd_sec_read_end;
+// ★【改造】sd_sec_read* / sd_init_done 已提升为模块端口，此处不再声明
 wire             bmp_data_wr_en;
 wire [23:0]      bmp_data;
-wire             sd_init_done;
 wire             bmp_ready;
 wire             scan_done;
 wire             scan_found_valid;
@@ -395,25 +397,15 @@ bmp_read bmp_read_m0(
     .bmp_data               (bmp_data)
 );
 
-sd_card_top sd_card_top_m0(
-    .clk                    (clk),
-    .rst                    (rst),
-    .SD_nCS                 (SD_nCS),
-    .SD_DCLK                (SD_DCLK),
-    .SD_MOSI                (SD_MOSI),
-    .SD_MISO                (SD_MISO),
-    .sd_init_done           (sd_init_done),
-    .sd_sec_read            (sd_sec_read),
-    .sd_sec_read_addr       (sd_sec_read_addr),
-    .sd_sec_read_data       (sd_sec_read_data),
-    .sd_sec_read_data_valid (sd_sec_read_data_valid),
-    .sd_sec_read_end        (sd_sec_read_end),
-    .sd_sec_write           (1'b0),
-    .sd_sec_write_addr      (32'd0),
-    .sd_sec_write_data      (),
-    .sd_sec_write_data_req  (),
-    .sd_sec_write_end       ()
-);
+//==========================================================================
+//  ★【改造】原例程在这里例化 sd_card_top（SD 卡控制器）。
+//    现在它被提到顶层，因为图片读取（本模块）和音频读取（wav_read）
+//    需要共用同一条 SPI 总线，由 sd_bus_arbiter 做扇区级仲裁。
+//
+//    本模块改为通过端口 sd_sec_read / sd_sec_read_addr /
+//    sd_sec_read_data* / sd_sec_read_end 访问 SD 卡，
+//    接口时序与原 sd_card_top 完全一致，所以内部逻辑一行没改。
+//==========================================================================
 
 //==========================================================================
 //  ★【新增】内部状态引出
