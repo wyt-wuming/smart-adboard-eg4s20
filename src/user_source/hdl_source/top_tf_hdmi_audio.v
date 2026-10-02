@@ -2,7 +2,7 @@
 module top(
     input                       clk,
     input                       rst_n,
-    input                       key1,           // 按键 KEY_2（引脚 B2）
+    input                       key1,           // 按键 KEY_3（引脚 B1）★ 相对例程已改引脚
     input                       key2,           // 按键 KEY_4（引脚 C1）
 
     // ---- ★【新增】4 个拨码开关（引脚从 HX4S20C 原理图查得）----

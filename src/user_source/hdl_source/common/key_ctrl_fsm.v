@@ -9,10 +9,10 @@
 //        SW1 → C8      SW2 → C7      SW3 → C6      SW4 → C5
 //
 //    按键（4 个，网络名 KEY_1~4 → FPGA 引脚）：
-//        KEY_1 → A2（例程里被当作复位键 rst_n）
-//        KEY_2 → B2（例程里叫 key1）
-//        KEY_3 → B1（★ 例程完全没用到的空闲按键）
-//        KEY_4 → C1（例程里叫 key2）
+//        KEY_1 → A2（例程里被当作复位键 rst_n，本设计保持复位功能）
+//        KEY_2 → B2（例程里叫 key1，本设计未使用）
+//        KEY_3 → B1（★ 本设计的 key1 —— 与 KEY_4 相邻，操作顺手）
+//        KEY_4 → C1（本设计的 key2）
 //
 //  【操作方式 —— 请把这张表抄到答辩 PPT 上】
 //
@@ -58,7 +58,7 @@ module key_ctrl_fsm #(
     input  wire       clk,               // 50MHz 板级时钟
     input  wire       rst,               // 高有效复位
 
-    input  wire       key1,              // 按键 KEY_2（引脚 B2）
+    input  wire       key1,              // 按键 KEY_3（引脚 B1）
     input  wire       key2,              // 按键 KEY_4（引脚 C1）
 
     // ---------------- 拨码开关（顶层已同步到本时钟域）----------------
