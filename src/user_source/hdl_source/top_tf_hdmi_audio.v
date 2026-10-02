@@ -314,6 +314,44 @@ cfg_cdc #(
     .O_data    (cfg_auto_play_sd)
 );
 
+// =========================================================================
+//  ★【重要】音频子系统相关的线网必须先在这里声明！
+// -------------------------------------------------------------------------
+//  Verilog 有个坑：信号如果在"使用之后"才声明，工具会先给它建一个
+//  1 位宽的"隐式线网"，后面真正的 32 位声明就会冲突（HDL-7225 严重警告），
+//  结果是地址/数据线连接被截断成 1 位，功能完全失效。
+//  所以下面这些线网必须写在 sd_card_bmp 例化之前。
+// =========================================================================
+
+// ---- 面向 sd_card_top 的总线（仲裁器输出）----
+wire        sd_bus_sec_read;
+wire [31:0] sd_bus_sec_read_addr;
+wire [7:0]  sd_bus_sec_read_data;
+wire        sd_bus_sec_read_dv;
+wire        sd_bus_sec_read_end;
+wire        sd_init_done_bus;        // SD 卡初始化完成
+
+// ---- BMP 通道线（仲裁器 <-> sd_card_bmp）----
+wire        bmp_sd_sec_read;
+wire [31:0] bmp_sd_sec_read_addr;
+wire [7:0]  bmp_sd_sec_read_data;
+wire        bmp_sd_sec_read_dv;
+wire        bmp_sd_sec_read_end;
+
+// ---- WAV 通道线（仲裁器 <-> wav_read）----
+wire        wav_sd_sec_read;
+wire [31:0] wav_sd_sec_read_addr;
+wire [7:0]  wav_sd_sec_read_data;
+wire        wav_sd_sec_read_dv;
+wire        wav_sd_sec_read_end;
+
+// ---- 音频 FIFO 线 ----
+wire [31:0] audio_fifo_dout;
+wire        audio_fifo_empty;
+wire        audio_fifo_full;
+wire [8:0]  audio_fifo_wrusedw;   // 512 深 → 水位计数 9 位
+wire        audio_fifo_re;
+
 // ===================== TF 多图扫描与缓存（双缓冲） =====================
 // 新增的状态输出线（供 OSD / 转场使用）
 wire        load_busy_sd;         // 正在装载新图
@@ -387,36 +425,10 @@ sd_card_bmp #(
 //  这也是合规要求："音频处理方法不能和参考例程相同"。
 // =========================================================================
 
-// ---- 仲裁器对外接口线（连到 sd_card_top）----
-wire        sd_bus_sec_read;
-wire [31:0] sd_bus_sec_read_addr;
-wire [7:0]  sd_bus_sec_read_data;
-wire        sd_bus_sec_read_dv;
-wire        sd_bus_sec_read_end;
-
-// ---- BMP 通道线（仲裁器 <-> sd_card_bmp）----
-wire        bmp_sd_sec_read;
-wire [31:0] bmp_sd_sec_read_addr;
-wire [7:0]  bmp_sd_sec_read_data;
-wire        bmp_sd_sec_read_dv;
-wire        bmp_sd_sec_read_end;
-
-// ---- WAV 通道线（仲裁器 <-> wav_read）----
-wire        wav_sd_sec_read;
-wire [31:0] wav_sd_sec_read_addr;
-wire [7:0]  wav_sd_sec_read_data;
-wire        wav_sd_sec_read_dv;
-wire        wav_sd_sec_read_end;
-
-// ---- 音频 FIFO 线 ----
-wire [31:0] audio_fifo_dout;
-wire        audio_fifo_empty;
-wire        audio_fifo_full;
-wire [8:0]  audio_fifo_wrusedw;   // 512 深 → 水位计数 9 位（与该 IP 输出位宽一致）
-wire        audio_fifo_re;
-
 // ---- SD 卡控制器（唯一实例）----
-wire        sd_init_done_bus;
+//  注意：sd_bus_* / bmp_sd_* / wav_sd_* / audio_fifo_* / sd_init_done_bus
+//        这些线网已经提到前面（sd_card_bmp 例化之前）统一声明了，
+//        这里不再重复声明 —— 重复声明会与"隐式线网"冲突（HDL-7225）。
 
 sd_card_top #(
     .SPI_LOW_SPEED_DIV  (248),
