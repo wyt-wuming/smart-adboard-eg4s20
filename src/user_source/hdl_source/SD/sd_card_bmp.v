@@ -142,7 +142,32 @@ assign write_finish_pulse = wrfin_tgl_sync[2] ^ wrfin_tgl_sync[1];
 //     结果是 press_pulse 永远不产生 —— 按键完全失效！
 //     这是本次改造中最隐蔽、最容易踩的坑，务必保留此注释。
 //--------------------------------------------------------------------------
-assign key_next_press = key_next;
+//--------------------------------------------------------------------------
+// ★【修复】按键脉冲跨时钟域同步
+//   key_next 是从 50MHz 的 clk 域送过来的"单拍脉冲"（宽 20ns），
+//   而本模块工作在 100MHz 的 sd_card_clk 域。
+//   直接采样属于跨时钟域，偶尔会因亚稳态漏掉脉冲 ——
+//   现象就是"按了按键但图片没反应"。
+//
+//   正确做法：先打 2 拍同步到本时钟域，再做上升沿检测，得到干净的单拍脉冲。
+//   20ns 的脉冲在 100MHz（周期 10ns）下至少横跨一个完整时钟沿，
+//   所以 2 级同步器一定能采到，不会再丢。
+//--------------------------------------------------------------------------
+reg key_next_s0, key_next_s1, key_next_s2;
+
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        key_next_s0 <= 1'b0;
+        key_next_s1 <= 1'b0;
+        key_next_s2 <= 1'b0;
+    end else begin
+        key_next_s0 <= key_next;
+        key_next_s1 <= key_next_s0;
+        key_next_s2 <= key_next_s1;
+    end
+end
+
+assign key_next_press = key_next_s1 & ~key_next_s2;   // 上升沿 → 干净的单拍脉冲
 
 function [1:0] next_index_limited;
     input [1:0] cur;
