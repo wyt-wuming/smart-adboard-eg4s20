@@ -10,9 +10,9 @@
 //
 //    按键（4 个，网络名 KEY_1~4 → FPGA 引脚）：
 //        KEY_1 → A2（例程里被当作复位键 rst_n，本设计保持复位功能）
-//        KEY_2 → B2（例程里叫 key1，本设计未使用）
-//        KEY_3 → B1（★ 本设计的 key1 —— 与 KEY_4 相邻，操作顺手）
-//        KEY_4 → C1（本设计的 key2）
+//        KEY_2 → B2（★ 本设计的 key3 —— 专用"减键"，见下面的功能表）
+//        KEY_3 → B1（本设计的 key1 —— 与 KEY_4 相邻，操作顺手）
+//        KEY_4 → C1（本设计的 key2 —— 专用"加键"）
 //
 //  【操作方式 —— 请把这张表抄到答辩 PPT 上】
 //
@@ -21,20 +21,32 @@
 //    ├───────────┼──────────────────────────┼──────────────────────────┤
 //    │   SW1     │  调节模式 ADJUST          │  工作模式 RUN            │
 //    │   SW2     │  自动轮播（定时切图）      │  固定（停在当前图）      │
-//    │   SW3     │  淡入淡出转场             │  硬切（瞬间切换）        │
-//    │   SW4     │  显示 OSD 字幕/时间        │  隐藏 OSD                │
+//    │   SW3     │  播放音乐                 │  静音                    │
+//    │   SW4     │  显示底部字幕传送带        │  隐藏字幕                │
 //    └───────────┴──────────────────────────┴──────────────────────────┘
 //
 //    ┌───────────┬──────────────────────────┬──────────────────────────┐
 //    │   按键     │  工作模式（SW1=OFF）      │  调节模式（SW1=ON）      │
 //    ├───────────┼──────────────────────────┼──────────────────────────┤
 //    │ key1 短按  │  手动切下一张广告图        │  切换要调节的参数项       │
-//    │ key1 长按  │  快速连播（按住不停切图）  │  当前参数 -1（可连减）   │
-//    │ key2 短按  │  轮播周期 +1 档            │  当前参数 +1（可连加）   │
+//    │ key1 长按  │  快速连播（按住不停切图）  │  ——（已挪到 key3）        │
+//    │ key2 短按  │  轮播周期 +1 秒（5~30）    │  当前参数 +1（可连加）   │
 //    │ key2 长按  │  ——（保留）               │  当前参数 +1（可连加）   │
+//    │ key3 短按  │  轮播周期 -1 秒（5~30）    │  当前参数 -1（可连减）   │
+//    │ key3 长按  │  ——（保留）               │  当前参数 -1（可连减）   │
 //    └───────────┴──────────────────────────┴──────────────────────────┘
 //
+//    key1 = KEY_3(B1)   key2 = KEY_4(C1)   key3 = KEY_2(B2)
+//    ★ 本版改动：把 key1 长按的"减"挪到了 key3（KEY_2），
+//      现在 key2 专管加、key3 专管减，一加一减对称，不用长按了。
+//
 //    调节项循环顺序：亮度 BRI → 对比度 CON → 轮播周期 PER → 亮度 …
+//
+//    参数取值范围：
+//        亮度   0 ~ 31（16 = 中性，越小越暗）
+//        对比度 0 ~ 31（16 = 中性，越小越灰）
+//        轮播周期 5 ~ 30 秒，每一个整数都能取到（默认 5 秒）
+//                 到 30 再按 +1 会回到 5；到 5 再按 -1 会回到 30
 //
 //  【为什么用拨码开关而不是双击】
 //    拨码开关是"看得见的状态"，评委一眼就知道当前处于什么模式；
@@ -58,17 +70,20 @@ module key_ctrl_fsm #(
     input  wire       clk,               // 50MHz 板级时钟
     input  wire       rst,               // 高有效复位
 
-    input  wire       key1,              // 按键 KEY_3（引脚 B1）
-    input  wire       key2,              // 按键 KEY_4（引脚 C1）
+    input  wire       key1,              // 按键 KEY_3（引脚 B1）切图 / 切换调节项
+    input  wire       key2,              // 按键 KEY_4（引脚 C1）周期+ / 参数+
+    input  wire       key3,              // ★【新增】按键 KEY_2（引脚 B2）周期− / 参数−
 
     // ---------------- 拨码开关（顶层已同步到本时钟域）----------------
     input  wire       sw_mode,           // SW1(C8): 1=调节模式，0=工作模式
     input  wire       sw_auto,           // SW2(C7): 1=自动轮播，0=固定
-    input  wire       sw_trans,          // SW3(C6): 1=淡入淡出，0=硬切
+    input  wire       sw_music,          // SW3(C6): 1=播放音乐，0=静音
     input  wire       sw_osd,            // SW4(C5): 1=显示OSD，0=隐藏
 
     // ---------------- 输出配置 ----------------
-    output reg  [7:0] O_period_sec,      // 轮播周期（秒）
+    // ★ O_period_sec 必须用 wire：它是被下面 assign 连续赋值的。
+    //   如果写成 output reg，TD 会报 HDL-8007 语法错误。
+    output wire [7:0] O_period_sec,      // 轮播周期（秒），0~30 连续可调
     output reg  [4:0] O_brightness,      // 亮度 0..31（16=中性）
     output reg  [4:0] O_contrast,        // 对比度 0..31（16=中性）
     output reg  [1:0] O_adj_sel,         // 当前调节项 0=亮度 1=对比度 2=周期
@@ -79,7 +94,7 @@ module key_ctrl_fsm #(
     // ---------------- 派生输出（直接由拨码开关决定）----------------
     output wire       O_adj_mode,        // 1=调节模式
     output wire       O_auto_play,       // 1=自动轮播
-    output wire       O_fade_en,         // 1=开启转场
+    output wire       O_music_en,        // 1=播放音乐
     output wire       O_osd_en           // 1=显示 OSD
 );
 
@@ -90,13 +105,13 @@ module key_ctrl_fsm #(
     //--------------------------------------------------------------------------
     wire sw_mode_on  = (sw_mode  == SW_ACTIVE_HIGH);
     wire sw_auto_on  = (sw_auto  == SW_ACTIVE_HIGH);
-    wire sw_trans_on = (sw_trans == SW_ACTIVE_HIGH);
+    wire sw_music_on = (sw_music == SW_ACTIVE_HIGH);
     wire sw_osd_on   = (sw_osd   == SW_ACTIVE_HIGH);
 
     // 4 个开关直接决定 4 个系统状态（组合逻辑，拨动立即生效，无需按键）
     assign O_adj_mode  = sw_mode_on;      // SW1 → 运行/调节模式
     assign O_auto_play = sw_auto_on;      // SW2 → 自动轮播开关
-    assign O_fade_en   = sw_trans_on;     // SW3 → 转场特效开关
+    assign O_music_en  = sw_music_on;     // SW3 → 音乐开关
     assign O_osd_en    = sw_osd_on;       // SW4 → OSD 字幕开关
 
     //--------------------------------------------------------------------------
@@ -116,6 +131,7 @@ module key_ctrl_fsm #(
     //==========================================================================
     wire k1_press, k1_long, k1_rep, k1_dbl;
     wire k2_press, k2_long, k2_rep, k2_dbl;
+    wire k3_press, k3_long, k3_rep, k3_dbl;   // ★ 新增：KEY_2（B2）减键
 
     key_press_event #(
         .CLK_FREQ_HZ (CLK_FREQ_HZ),
@@ -149,24 +165,49 @@ module key_ctrl_fsm #(
         .double_pulse (k2_dbl)
     );
 
-    //==========================================================================
-    //  第 2 部分：周期档位表（8 档）
-    //    ★ 只在这一处维护周期表，避免多个文件各写一份导致不一致
-    //==========================================================================
-    reg [2:0] period_idx;
+    // ---- ★【新增】key3 = KEY_2（B2）：专门当"减键" ----
+    key_press_event #(
+        .CLK_FREQ_HZ (CLK_FREQ_HZ),
+        .DEBOUNCE_MS (20),
+        .LONG_MS     (800),
+        .REPEAT_MS   (150),
+        .DOUBLE_MS   (150)
+    ) u_key3_event (
+        .clk          (clk),
+        .rst          (rst),
+        .button_in    (key3),
+        .press_pulse  (k3_press),
+        .long_pulse   (k3_long),
+        .repeat_pulse (k3_rep),
+        .double_pulse (k3_dbl)
+    );
 
-    always @(*) begin
-        case (period_idx)
-            3'd0: O_period_sec = 8'd2;      // 2 秒
-            3'd1: O_period_sec = 8'd3;      // 3 秒
-            3'd2: O_period_sec = 8'd5;      // 5 秒（默认）
-            3'd3: O_period_sec = 8'd8;      // 8 秒
-            3'd4: O_period_sec = 8'd10;     // 10 秒
-            3'd5: O_period_sec = 8'd15;     // 15 秒
-            3'd6: O_period_sec = 8'd20;     // 20 秒
-            default: O_period_sec = 8'd30;  // 30 秒
-        endcase
-    end
+    //==========================================================================
+    //  第 2 部分：轮播周期（0 ~ 30 秒，全部整数都能取到，共 31 档）
+    //--------------------------------------------------------------------------
+    //  ★ 改造说明
+    //    以前是 8 个固定档位（2/3/5/8/10/15/20/30 秒），
+    //    现在改成 0~30 之间"每一个整数"都能取到，颗粒度 1 秒。
+    //
+    //  ★ 关于"0 秒"这个特殊值
+    //    0 秒在 sd_card_bmp 里被防御性处理成 1 秒（见那里的 period_target），
+    //    所以不会出现除零、也不会出现"减 1 下溢"。
+    //    实际效果是"每秒换一张图"，正好当作最快轮播来演示。
+    //
+    //  ★ 只在这一处维护周期常量，避免多个文件各写一份导致不一致
+    //==========================================================================
+    // ★ 轮播周期范围：5 ~ 30 秒
+    //   下限从 0 提到 5 秒，是因为周期太短时：
+    //     ① 一张图装载要 350ms，周期 1 秒的话有 1/3 时间在装载
+    //     ② 转场还没演完就该换下一张了
+    //   5 秒是个舒服的下限。
+    localparam [7:0] PER_MIN = 8'd5;      // 最小周期  5 秒
+    localparam [7:0] PER_MAX = 8'd30;     // 最大周期 30 秒
+    localparam [7:0] PER_DEF = 8'd5;      // 上电默认  5 秒
+
+    reg [7:0] period_val;                 // 当前周期值（秒），范围 0~30
+
+    assign O_period_sec = period_val;
 
     //==========================================================================
     //  第 3 部分：参数增减任务（用 task 让主逻辑更简洁易懂）
@@ -180,9 +221,9 @@ module key_ctrl_fsm #(
                 SEL_CON: begin
                     if (O_contrast < CON_MAX) O_contrast <= O_contrast + 5'd1;
                 end
-                default: begin                    // SEL_PER：周期档位循环加
-                    if (period_idx < 3'd7) period_idx <= period_idx + 3'd1;
-                    else                   period_idx <= 3'd0;
+                default: begin                    // SEL_PER：周期 +1 秒（到 30 回 0）
+                    if (period_val < PER_MAX) period_val <= period_val + 8'd1;
+                    else                      period_val <= PER_MIN;
                 end
             endcase
         end
@@ -197,9 +238,9 @@ module key_ctrl_fsm #(
                 SEL_CON: begin
                     if (O_contrast > CON_MIN) O_contrast <= O_contrast - 5'd1;
                 end
-                default: begin                    // SEL_PER：周期档位循环减
-                    if (period_idx > 3'd0) period_idx <= period_idx - 3'd1;
-                    else                   period_idx <= 3'd7;
+                default: begin                    // SEL_PER：周期 -1 秒（到 0 回 30）
+                    if (period_val > PER_MIN) period_val <= period_val - 8'd1;
+                    else                      period_val <= PER_MAX;
                 end
             endcase
         end
@@ -210,7 +251,7 @@ module key_ctrl_fsm #(
     //==========================================================================
     always @(posedge clk or posedge rst) begin
         if (rst) begin
-            period_idx       <= 3'd2;        // 默认 5 秒
+            period_val       <= PER_DEF;     // 默认 5 秒
             O_brightness     <= BRI_MID;     // 默认中性
             O_contrast       <= CON_MID;     // 默认中性
             O_adj_sel        <= SEL_BRI;     // 默认调节亮度
@@ -220,9 +261,10 @@ module key_ctrl_fsm #(
             O_key_next_pulse <= 1'b0;
 
             //==================================================================
-            //  key1
+            //  key1 = KEY_3（B1）
             //    工作模式：短按 = 下一张；长按/连发 = 快速连播
-            //    调节模式：短按 = 切换调节项；长按/连发 = 当前项 -1
+            //    调节模式：短按 = 切换调节项
+            //    ★ 原来挂在 key1 长按上的"减"已经挪到 key3（KEY_2 / B2）了
             //==================================================================
             if (O_adj_mode == 1'b0) begin
                 // ---- 工作模式 ----
@@ -232,8 +274,6 @@ module key_ctrl_fsm #(
                 // ---- 调节模式 ----
                 if (k1_press)
                     O_adj_sel <= (O_adj_sel == SEL_PER) ? SEL_BRI : (O_adj_sel + 2'd1);
-                if (k1_rep)
-                    adj_down;                     // 长按连续减
             end
 
             //==================================================================
@@ -244,13 +284,30 @@ module key_ctrl_fsm #(
             if (O_adj_mode == 1'b0) begin
                 // ---- 工作模式：周期 +1 档 ----
                 if (k2_press) begin
-                    if (period_idx < 3'd7) period_idx <= period_idx + 3'd1;
-                    else                   period_idx <= 3'd0;
+                    if (period_val < PER_MAX) period_val <= period_val + 8'd1;
+                    else                      period_val <= PER_MIN;
                 end
             end else begin
                 // ---- 调节模式：参数 +1 ----
                 if (k2_press || k2_rep)
                     adj_up;
+            end
+
+            //==================================================================
+            //  key3 = KEY_2（B2）★【新增】专门当"减键"
+            //    工作模式：短按 = 轮播周期 -1 秒（对称于 key2 的 +1）
+            //    调节模式：短按/长按连发 = 当前参数 -1
+            //==================================================================
+            if (O_adj_mode == 1'b0) begin
+                // ---- 工作模式：周期 -1 秒 ----
+                if (k3_press) begin
+                    if (period_val > PER_MIN) period_val <= period_val - 8'd1;
+                    else                      period_val <= PER_MAX;
+                end
+            end else begin
+                // ---- 调节模式：参数 -1 ----
+                if (k3_press || k3_rep)
+                    adj_down;
             end
 
         end

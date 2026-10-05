@@ -36,7 +36,7 @@ module sd_card_bmp #(
     // ---- ★【新增】给 OSD / 转场模块用的状态输出 ----
     output                      O_load_busy,      // 正在装载新图（转场淡出用）
     output                      O_auto_play_en,   // 自动轮播是否开启（OSD 显示用）
-    output [1:0]                O_img_idx,        // 当前显示第几张（OSD 显示用）
+    output [2:0]                O_img_idx,        // 当前显示第几张（OSD 显示用）★ 2→3 位
     output [2:0]                O_img_found_count,// 共找到几张图（OSD 显示用）
 
     input                       write_finish_toggle,
@@ -86,13 +86,19 @@ reg [26:0]       sec_div_cnt;      // 1 秒分频计数器（100MHz 时钟下数
 reg              tick_1sec;        // 1 秒单拍脉冲
 reg [15:0]       auto_sec_cnt;     // 自动轮播已累计的秒数
 reg [2:0]        img_found_count;
-reg [1:0]        img_idx;              // 当前真正显示中的图片编号
-reg [1:0]        load_idx;             // 当前正在写入的图片编号
+// ★【改造】图片编号从 2 位加宽到 3 位（原来只能数到 3，只能放 4 张图）
+reg [2:0]        img_idx;              // 当前真正显示中的图片编号 0~6
+reg [2:0]        load_idx;             // 当前正在写入的图片编号 0~6
 reg [1:0]        pending_buf_idx;      // 当前正在写入的目标缓冲区
 reg [31:0]       img_sector0;
 reg [31:0]       img_sector1;
 reg [31:0]       img_sector2;
 reg [31:0]       img_sector3;
+// ★【新增】第 5~8 个槽位（原来只有 4 个，卡上多的图轮不到）
+reg [31:0]       img_sector4;
+reg [31:0]       img_sector5;
+reg [31:0]       img_sector6;
+reg [31:0]       img_sector7;
 reg              next_req_pending;
 reg              load_busy;
 
@@ -171,29 +177,32 @@ end
 
 assign key_next_press = key_next_s1 & ~key_next_s2;   // 上升沿 → 干净的单拍脉冲
 
-function [1:0] next_index_limited;
-    input [1:0] cur;
+// ★【改造】原来只支持 4 张图（写死 4 个 case），现在改成"按实际找到的张数
+//   自动环绕"，最大 8 张。这样卡上放几张就轮几张，加图减图都不用改代码。
+function [2:0] next_index_limited;
+    input [2:0] cur;
     input [2:0] count;
     begin
-        case (count)
-            3'd0: next_index_limited = 2'd0;
-            3'd1: next_index_limited = 2'd0;
-            3'd2: next_index_limited = (cur == 2'd1) ? 2'd0 : (cur + 2'd1);
-            3'd3: next_index_limited = (cur == 2'd2) ? 2'd0 : (cur + 2'd1);
-            default: next_index_limited = (cur == 2'd3) ? 2'd0 : (cur + 2'd1);
-        endcase
+        // 只有 0 张 或 已经到最后一个 → 回到 0；否则 +1
+        if ((count == 3'd0) || ((cur + 3'd1) >= count))
+            next_index_limited = 3'd0;
+        else
+            next_index_limited = cur + 3'd1;
     end
 endfunction
 
 function [31:0] sector_lut;
-    input [1:0] idx;
+    input [2:0] idx;
     begin
         case (idx)
-            2'd0: sector_lut = img_sector0;
-            2'd1: sector_lut = img_sector1;
-            2'd2: sector_lut = img_sector2;
-            2'd3: sector_lut = img_sector3;
-            default: sector_lut = img_sector0;
+            3'd0: sector_lut = img_sector0;
+            3'd1: sector_lut = img_sector1;
+            3'd2: sector_lut = img_sector2;
+            3'd3: sector_lut = img_sector3;
+            3'd4: sector_lut = img_sector4;
+            3'd5: sector_lut = img_sector5;
+            3'd6: sector_lut = img_sector6;
+            default: sector_lut = img_sector7;
         endcase
     end
 endfunction
@@ -221,8 +230,8 @@ always @(posedge clk or posedge rst) begin
         first_image_committed <= 1'b0;
         auto_sec_cnt          <= 16'd0;
         img_found_count       <= 3'd0;
-        img_idx               <= 2'd0;
-        load_idx              <= 2'd0;
+        img_idx               <= 3'd0;
+        load_idx              <= 3'd0;
         pending_buf_idx       <= 2'd0;
         write_buf_idx         <= 2'd0;
         disp_buf_idx          <= 2'd0;
@@ -230,6 +239,10 @@ always @(posedge clk or posedge rst) begin
         img_sector1           <= 32'd0;
         img_sector2           <= 32'd0;
         img_sector3           <= 32'd0;
+        img_sector4           <= 32'd0;
+        img_sector5           <= 32'd0;
+        img_sector6           <= 32'd0;
+        img_sector7           <= 32'd0;
         next_req_pending      <= 1'b0;
         load_busy             <= 1'b0;
         source_done_seen      <= 1'b0;
@@ -244,8 +257,8 @@ always @(posedge clk or posedge rst) begin
             first_image_committed <= 1'b0;
             auto_sec_cnt          <= 16'd0;
             img_found_count       <= 3'd0;
-            img_idx               <= 2'd0;
-            load_idx              <= 2'd0;
+            img_idx               <= 3'd0;
+            load_idx              <= 3'd0;
             pending_buf_idx       <= 2'd0;
             write_buf_idx         <= 2'd0;
             disp_buf_idx          <= 2'd0;
@@ -253,22 +266,29 @@ always @(posedge clk or posedge rst) begin
             img_sector1           <= 32'd0;
             img_sector2           <= 32'd0;
             img_sector3           <= 32'd0;
+        img_sector4           <= 32'd0;
+        img_sector5           <= 32'd0;
+        img_sector6           <= 32'd0;
+        img_sector7           <= 32'd0;
             next_req_pending      <= 1'b0;
             load_busy             <= 1'b0;
             source_done_seen      <= 1'b0;
             display_valid         <= 1'b0;
         end else begin
-            // 扫描阶段缓存前 4 张图的起始 sector
+            // 扫描阶段缓存前 8 张图的起始 sector（★ 原来只存 4 张）
             if (scan_found_valid) begin
                 case (img_found_count)
                     3'd0: img_sector0 <= scan_found_sector;
                     3'd1: img_sector1 <= scan_found_sector;
                     3'd2: img_sector2 <= scan_found_sector;
                     3'd3: img_sector3 <= scan_found_sector;
-                    default: ;
+                    3'd4: img_sector4 <= scan_found_sector;
+                    3'd5: img_sector5 <= scan_found_sector;
+                    3'd6: img_sector6 <= scan_found_sector;
+                    default: img_sector7 <= scan_found_sector;
                 endcase
 
-                if (img_found_count < 3'd4)
+                if (img_found_count < 3'd7)
                     img_found_count <= img_found_count + 3'd1;
             end
 
@@ -295,8 +315,8 @@ always @(posedge clk or posedge rst) begin
                 first_image_committed <= 1'b0;
                 auto_sec_cnt          <= 16'd0;
                 img_found_count       <= 3'd0;
-                img_idx               <= 2'd0;
-                load_idx              <= 2'd0;
+                img_idx               <= 3'd0;
+                load_idx              <= 3'd0;
                 pending_buf_idx       <= 2'd0;
                 write_buf_idx         <= 2'd0;
                 disp_buf_idx          <= 2'd0;
@@ -327,7 +347,7 @@ always @(posedge clk or posedge rst) begin
 
                 // 首图自动加载到 buffer0
                 if (scan_done && !first_image_committed && bmp_ready && !load_busy && (img_found_count != 3'd0)) begin
-                    load_idx         <= 2'd0;
+                    load_idx         <= 3'd0;
                     load_sector      <= img_sector0;
                     pending_buf_idx  <= 2'd0;
                     write_buf_idx    <= 2'd0;

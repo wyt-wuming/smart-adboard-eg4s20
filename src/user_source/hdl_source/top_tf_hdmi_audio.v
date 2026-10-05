@@ -2,8 +2,9 @@
 module top(
     input                       clk,
     input                       rst_n,
-    input                       key1,           // 按键 KEY_3（引脚 B1）★ 相对例程已改引脚
-    input                       key2,           // 按键 KEY_4（引脚 C1）
+    input                       key1,           // 按键 KEY_3（引脚 B1）切图 / 切换调节项
+    input                       key2,           // 按键 KEY_4（引脚 C1）周期+ / 参数+
+    input                       key3,           // ★【新增】按键 KEY_2（引脚 B2）减键
 
     // ---- ★【新增】4 个拨码开关（引脚从 HX4S20C 原理图查得）----
     //   SW1 → C8 ：工作模式 / 调节模式
@@ -216,7 +217,7 @@ wire [4:0] cfg_brightness;      // 亮度 0..31      → 送 video_clk 域
 wire [4:0] cfg_contrast;        // 对比度 0..31    → 送 video_clk 域
 wire       cfg_adj_mode;        // 运行/调节模式   → 送 video_clk 域
 wire [1:0] cfg_adj_sel;         // 当前调节项      → 送 video_clk 域
-wire       cfg_fade_en;         // 转场使能        → 送 video_clk 域
+wire       cfg_music_en;        // 音乐开关(SW3)   → 送 video_clk 域
 wire       cfg_osd_en;          // OSD 使能        → 送 video_clk 域
 wire       cfg_auto_play;       // 自动轮播开关    → 送 sd_card_clk 域
 wire       key_next_pulse;      // 手动切下一张（单拍脉冲）
@@ -229,9 +230,10 @@ key_ctrl_fsm #(
     .rst              (rst_all),
     .key1             (key1),
     .key2             (key2),
+    .key3             (key3),           // ★ 新增：KEY_2（B2）减键
     .sw_mode          (sw1_sync1),
     .sw_auto          (sw2_sync1),
-    .sw_trans         (sw3_sync1),
+    .sw_music         (sw3_sync1),
     .sw_osd           (sw4_sync1),
     .O_period_sec     (cfg_period_sec),
     .O_brightness     (cfg_brightness),
@@ -240,7 +242,7 @@ key_ctrl_fsm #(
     .O_key_next_pulse (key_next_pulse),
     .O_adj_mode       (cfg_adj_mode),
     .O_auto_play      (cfg_auto_play),
-    .O_fade_en        (cfg_fade_en),
+    .O_music_en       (cfg_music_en),
     .O_osd_en         (cfg_osd_en)
 );
 
@@ -266,13 +268,13 @@ cfg_cdc #(
 
 // 视频域配置字段分配：
 //   [15:11] 亮度   [10:6] 对比度   [5] 运行/调节模式
-//   [4:3]   调节项 [2]    转场开关 [1] OSD 开关   [0] 预留
+//   [4:3]   调节项 [2]    音乐开关 [1] OSD 开关   [0] 预留
 wire [15:0] cfg_video_src = {
     cfg_brightness,      // [15:11]
     cfg_contrast,        // [10:6]
     cfg_adj_mode,        // [5]
     cfg_adj_sel,         // [4:3]
-    cfg_fade_en,         // [2]   转场开关（SW3）
+    cfg_music_en,        // [2]   音乐开关（SW3）
     cfg_osd_en,          // [1]   OSD 开关（SW4）
     1'b0                 // [0]   预留
 };
@@ -294,7 +296,7 @@ wire [4:0] vcfg_brightness = cfg_video[15:11];
 wire [4:0] vcfg_contrast   = cfg_video[10:6];
 wire       vcfg_adj_mode   = cfg_video[5];
 wire [1:0] vcfg_adj_sel    = cfg_video[4:3];
-wire       vcfg_fade_en    = cfg_video[2];   // 转场开关（阶段 3 使用）
+wire       vcfg_music_en   = cfg_video[2];   // 音乐开关（SW3）
 wire       vcfg_osd_en     = cfg_video[1];   // OSD 开关
 
 //--------------------------------------------------------------------------
@@ -362,6 +364,22 @@ wire [7:0]  wav_sd_sec_read_data;
 wire        wav_sd_sec_read_dv;
 wire        wav_sd_sec_read_end;
 
+// ---- TXT 字幕通道（第 3 个 SD 总线用户）----
+wire        txt_sd_sec_read;
+wire [31:0] txt_sd_sec_read_addr;
+wire [7:0]  txt_sd_sec_read_data;
+wire        txt_sd_sec_read_dv;
+wire        txt_sd_sec_read_end;
+
+// ---- 字幕跨时钟域握手（sd_card_clk 100MHz → video_clk 25MHz）----
+wire [9:0]  txt_idx;          // 字库索引
+wire        txt_req_tgl;      // 请求翻转
+wire        txt_ack_tgl;      // 应答翻转
+wire        txt_scan_done;
+wire        txt_scan_found;
+wire [2:0]  txt_err_code;
+wire [3:0]  txt_state_code;
+
 // ---- 音频 FIFO 线 ----
 wire [31:0] audio_fifo_dout;
 wire        audio_fifo_empty;
@@ -373,7 +391,7 @@ wire        audio_fifo_re;
 // 新增的状态输出线（供 OSD / 转场使用）
 wire        load_busy_sd;         // 正在装载新图
 wire        auto_play_en_sd;      // 自动轮播开关状态
-wire [1:0]  img_idx_sd;           // 当前第几张
+wire [2:0]  img_idx_sd;           // 当前第几张（★ 2→3 位，支持更多图）
 wire [2:0]  img_found_count_sd;   // 共几张
 
 sd_card_bmp #(
@@ -507,6 +525,53 @@ always @(posedge sd_card_clk or posedge rst_all) begin
     end
 end
 
+// =========================================================================
+//  TXT 字幕扫描启动脉冲
+// -------------------------------------------------------------------------
+//  字幕文件很小（1~2 个扇区），而且在仲裁器里排在图片之前，
+//  所以不需要像 WAV 那样延迟启动 —— 画面一出来就可以扫。
+//  扫完之后 txt_read 就再也不请求总线了，对图片/音频零影响。
+// =========================================================================
+reg  [21:0] txt_scan_dly;
+reg         txt_scan_start;
+
+always @(posedge sd_card_clk or posedge rst_all) begin
+    if (rst_all) begin
+        txt_scan_dly   <= 22'd0;
+        txt_scan_start <= 1'b0;
+    end else begin
+        txt_scan_start <= 1'b0;
+        if (sd_init_done_bus && display_valid) begin
+            if (txt_scan_dly < 22'h0F_FFFF)
+                txt_scan_dly <= txt_scan_dly + 22'd1;
+            else if (txt_scan_dly == 22'h0F_FFFF) begin
+                txt_scan_start <= 1'b1;         // 单拍脉冲，启动字幕扫描
+                txt_scan_dly   <= 22'h0F_FFFF + 22'd1;
+            end
+        end
+    end
+end
+
+// ---- TXT 字幕读取模块 ----
+txt_read u_txt_read (
+    .clk                    (sd_card_clk),
+    .rst                    (rst_all),
+    .scan_start             (txt_scan_start),
+    .scan_max_sector        (32'd131071),
+    .scan_done              (txt_scan_done),
+    .scan_found             (txt_scan_found),
+    .txt_err_code           (txt_err_code),
+    .sd_sec_read            (txt_sd_sec_read),
+    .sd_sec_read_addr       (txt_sd_sec_read_addr),
+    .sd_sec_read_data       (txt_sd_sec_read_data),
+    .sd_sec_read_data_valid (txt_sd_sec_read_dv),
+    .sd_sec_read_end        (txt_sd_sec_read_end),
+    .O_idx                  (txt_idx),
+    .O_req_tgl              (txt_req_tgl),
+    .I_ack_tgl              (txt_ack_tgl),
+    .state_code             (txt_state_code)
+);
+
 // ---- WAV 扫描/读取模块 ----
 wire        wav_scan_done;
 wire        wav_scan_found;
@@ -558,9 +623,16 @@ sd_bus_arbiter u_sd_bus_arbiter (
     .wav_sec_read_data       (wav_sd_sec_read_data),
     .wav_sec_read_data_valid (wav_sd_sec_read_dv),
     .wav_sec_read_end        (wav_sd_sec_read_end),
+    .txt_sec_read            (txt_sd_sec_read),
+    .txt_sec_read_addr       (txt_sd_sec_read_addr),
+    .txt_sec_read_data       (txt_sd_sec_read_data),
+    .txt_sec_read_data_valid (txt_sd_sec_read_dv),
+    .txt_sec_read_end        (txt_sd_sec_read_end),
     .wav_fifo_wrusedw        (audio_fifo_wrusedw),
+    .wav_scan_done           (wav_scan_done),   // ★ 扫描期间不许音频"告急"，否则会饿死图片
     .O_grant_bmp             (),
-    .O_grant_wav             ()
+    .O_grant_wav             (),
+    .O_grant_txt             ()
 );
 
 // ---- 音频异步 FIFO ----
@@ -595,6 +667,14 @@ wire [23:0] aud_right;
 wire [15:0] aud_underrun;
 wire [15:0] aud_frame_cnt;
 
+// ★【新增】转场模块的线网，必须在"第一次被用到之前"先声明，
+//   否则会被综合器当成隐式线网、截断成 1 位 → HDL-7225 警告 + 功能异常。
+//   实际例化位置在下面 osd_adjust 之前，但这里 audio_player 就要用 fade_gain。
+wire [7:0]  fade_gain;      // 转场时的背景音乐音量（128~255）
+wire [1:0]  fade_state;     // 转场状态（调试用）
+wire [23:0] vout_fade;      // 转场处理后的像素
+wire        hs_fade, vs_fade, de_fade;
+
 audio_player #(
     .CLK_FREQ_HZ    (25_000_000),
     .SAMPLE_RATE_HZ (48_000)
@@ -607,7 +687,10 @@ audio_player #(
     .O_audio_valid      (aud_valid),
     .O_audio_left_data  (aud_left),
     .O_audio_right_data (aud_right),
-    .I_gain             (8'd255),           // 原音量（阶段3 接入淡入淡出联动）
+    // ★【按用户要求】音量恒定，转场只影响画面，绝不碰音频。
+    //   fade_ctrl 仍然输出 O_gain（音视频联动量），但这里故意不接 ——
+    //   如果以后想拿"音视频联动"这个加分项，把下面改成 (fade_gain) 即可。
+    .I_gain             (8'd255),           // 255 = 原音量，不衰减
     .O_underrun_cnt     (aud_underrun),
     .O_frame_cnt        (aud_frame_cnt)
 );
@@ -642,12 +725,26 @@ end
 
 wire [7:0] seg_d0, seg_d1, seg_d2, seg_d3, seg_d4, seg_d5;
 
+// ★ 字幕字符数要接给数码管调试用，必须**在使用之前**声明。
+//   否则 TD 会按"隐式线网"处理成 1 位（HDL-7225），调试数字就全错了。
+wire [9:0]  marq_text_len;
+
 seg_display u_seg_display (
     .I_state_code (state_code),
     .I_adj_mode   (cfg_adj_mode),
     .I_adj_sel    (cfg_adj_sel),
     .I_auto_play  (auto_play_sync1),
     .I_value      (seg_value),
+    // ---- 字幕调试（SW3 拨到 ON 时，数码管改显示字幕加载情况）----
+    //   SW3 本来是留给"淡入淡出转场"的，那个功能还没做，先借来当调试开关。
+    //   正常应显示：状态4 错误0 后三位是收到的字数
+    // ★ 数码管字幕调试模式：SW3 已经改作"音乐开关"了，所以这里先关掉。
+    //   想看字幕调试信息时，把下面这行改成 1'b1 重新编译即可
+    //   （显示内容见 seg_display.v 的端口说明）。
+    .I_debug      (1'b0),
+    .I_txt_state  (txt_state_code),
+    .I_txt_err    (txt_err_code),
+    .I_txt_len    (marq_text_len),
     .O_seg_0      (seg_d0),
     .O_seg_1      (seg_d1),
     .O_seg_2      (seg_d2),
@@ -746,6 +843,59 @@ image_processor u_image_processor (
 //  ★ 本模块内部把像素和 hs/vs/de 都延迟 2 拍，所以下游必须用它输出的
 //    de_osd / vs_osd，不能再用 de_proc / vs_proc。
 // =========================================================================
+
+// =========================================================================
+//  ★【新增】换图转场（第 2 级）：栅格化淡出 → 全黑 → 栅格化淡入  【加分项②】
+// -------------------------------------------------------------------------
+//  数据流：vout_proc → [fade_ctrl] → vout_fade → [osd_adjust] → ...
+//
+//  ★ 为什么放在 OSD 之前？
+//    这样字幕和调节界面不会被一起压黑。转场时画面在闪，字幕照常滚动，
+//    观感更专业（评委看到的是"画面在换、字幕不断"）。
+//
+//  ★ load_busy 跨时钟域：
+//    它来自 sd_card_bmp（sd_card_clk = 100MHz 域），
+//    本模块在 video_clk = 25MHz 域，必须打两拍同步后再用。
+// =========================================================================
+reg load_busy_s1, load_busy_s2;
+
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all) begin
+        load_busy_s1 <= 1'b0;
+        load_busy_s2 <= 1'b0;
+    end else begin
+        load_busy_s1 <= load_busy_sd;    // 100MHz 域
+        load_busy_s2 <= load_busy_s1;    // 25MHz 域
+    end
+end
+
+// ★ 这里不覆盖任何参数，全部用 fade_ctrl.v 里的默认值：
+//     GRID_LOG2=5  G_MAX=33  STEP_LOG2=1  FADE_LOG2=5
+//     PHASE_TICK=98  TICK_DIV=5102  WAIT_SEC=4
+//   转场总时长 = 98 x 5102 x 2 / 25MHz ≈ 40ms（固定，与轮播周期无关）
+//   想改快慢只改 fade_ctrl.v 里的 TICK_DIV 一个数即可。
+//   （不在这里写参数表，就不会出现"参数改名了忘了同步"这类编译错误）
+fade_ctrl u_fade_ctrl (
+    .video_clk   (video_clk),
+    .rst         (rst_all),
+    .I_de        (de_proc),
+    .I_hs        (hs_proc),
+    .I_vs        (vs_proc),
+    .I_rgb       (vout_proc),
+    .O_de        (de_fade),
+    .O_hs        (hs_fade),
+    .O_vs        (vs_fade),
+    .O_rgb       (vout_fade),
+    // 转场常开。拨码开关 4 个已经全部占满，如果以后想给它一个开关，
+    // 把这里改成对应的配置位即可（video 配置字 bit[0] 还是空的）。
+    .I_en        (1'b1),
+    .I_load_busy (load_busy_s2),
+    .I_period_sec(cfg_period_sec_v),   // ★ 转场时长 = 轮播周期的 1/10
+    .I_frame_new (1'b0),
+    .O_gain      (fade_gain),
+    .O_state     (fade_state)
+);
+
 wire [23:0] vout_osd;
 wire        hs_osd, vs_osd, de_osd;
 
@@ -757,10 +907,11 @@ wire [15:0] osd_value = (vcfg_adj_sel == 2'd0) ? {11'd0, vcfg_brightness} :  // 
 osd_adjust u_osd_adjust (
     .video_clk (video_clk),
     .rst       (rst_all),
-    .I_de      (de_proc),
-    .I_hs      (hs_proc),
-    .I_vs      (vs_proc),
-    .I_rgb     (vout_proc),
+    // ★ 注意：输入接的是 fade_ctrl 的输出，不是 image_processor 的输出
+    .I_de      (de_fade),
+    .I_hs      (hs_fade),
+    .I_vs      (vs_fade),
+    .I_rgb     (vout_fade),
     .O_de      (de_osd),
     .O_hs      (hs_osd),
     .O_vs      (vs_osd),
@@ -770,7 +921,50 @@ osd_adjust u_osd_adjust (
     .I_value   (osd_value)
 );
 
-assign vout_data = vout_osd;
+// =========================================================================
+//  第四级：底部传送带字幕（加分项①）
+// -------------------------------------------------------------------------
+//  数据流：vout_osd → [marquee_osd] → vout_data → AXIS → HDMI
+//
+//  显示效果：
+//      屏幕底部有一条半透明深色底条（y=440~479），
+//      白字从右往左滚动，速度 50 像素/秒，
+//      滚完一轮停 2 秒，然后循环。
+//
+//  文字来源：TF 卡上的字幕文件（开头必须是 #ZIMU#），
+//            由 txt_read 在开机时读进 BRAM，再跨时钟域送过来。
+//
+//  ★ 本模块内部把像素和 hs/vs/de 都延迟 4 拍，所以下游必须用它输出的
+//    de_marq / vs_marq，不能再用 de_osd / vs_osd。
+//  ★ 字幕开关直接用 SW4（vcfg_osd_en），和调节 OSD 共用一个开关。
+// =========================================================================
+wire [23:0] vout_marq;
+wire        hs_marq, vs_marq, de_marq;
+// （marq_text_len 已经在上面 seg_display 之前声明过了，这里不再重复声明）
+
+marquee_osd #(
+    .CLK_FREQ  (25_000_000),   // 视频时钟 25MHz
+    .SPEED_PPS (50),           // ★ 滚动速度 50 像素/秒
+    .PAUSE_MS  (2000)          // ★ 两轮之间停 2 秒
+) u_marquee_osd (
+    .video_clk (video_clk),
+    .rst       (rst_all),
+    .I_de      (de_osd),
+    .I_hs      (hs_osd),
+    .I_vs      (vs_osd),
+    .I_rgb     (vout_osd),
+    .O_de      (de_marq),
+    .O_hs      (hs_marq),
+    .O_vs      (vs_marq),
+    .O_rgb     (vout_marq),
+    .I_show    (vcfg_osd_en),     // SW4：字幕总开关
+    .I_idx     (txt_idx),
+    .I_req_tgl (txt_req_tgl),
+    .O_ack_tgl (txt_ack_tgl),
+    .O_text_len(marq_text_len)
+);
+
+assign vout_data = vout_marq;
 
 frame_read_write #(
     .WRITE_V_FLIP     (1),
@@ -863,8 +1057,8 @@ audio_arc_calculate #(
 video_rgb_to_axis_640x480 u_video_rgb_to_axis_640x480(
     .I_clk         (video_clk),
     .I_rst         (rst_all),
-    .I_vs          (vs_osd),
-    .I_de          (de_osd),
+    .I_vs          (vs_marq),      // ★ 必须用最后一级(传送带)输出的同步信号
+    .I_de          (de_marq),      //   —— 它比 vs_osd/de_osd 又晚 4 拍
     .I_rgb         (vout_data),
     .O_video_user  (axis_s_user),
     .O_video_valid (axis_s_valid),
@@ -880,6 +1074,17 @@ startup_pulse #(
     .I_rst   (rst_all),
     .O_pulse (edid_trig)
 );
+
+// ===================== 音乐开关（SW3）=====================
+//  关掉时只把"音频数据"置 0（静音），但 aud_valid 必须保持 48kHz 规律不变！
+//  原因：HDMI 接收端靠 ACR（音频时钟恢复）锁定采样率，如果 valid 也跟着断掉，
+//        接收端会失锁 → 电视端出现爆音/断音。
+//        这和 audio_player 里"underrun 时只把数据置 0"是同一个道理。
+//
+//  ★ 只静音、不停 SD 卡读取：这样拨回来是瞬间恢复，没有重新加载的延迟，
+//    代价仅仅是 SD 总线那 7% 的带宽（对图片轮播毫无影响）。
+wire [23:0] aud_left_out  = vcfg_music_en ? aud_left  : 24'd0;
+wire [23:0] aud_right_out = vcfg_music_en ? aud_right : 24'd0;
 
 // ===================== 带音频的 HDMI 1.4b 发射 =====================
 hdmi_1_4b_transmitter_core_wrapper #(
@@ -914,8 +1119,8 @@ hdmi_1_4b_transmitter_core_wrapper #(
 
     // ★【改造】音频数据来自 TF 卡（audio_player），不再是内部测试音
     .I_audio_valid      (aud_valid),
-    .I_audio_left_data  (aud_left),
-    .I_audio_right_data (aud_right),
+    .I_audio_left_data  (aud_left_out),     // ★ 经过 SW3 音乐开关
+    .I_audio_right_data (aud_right_out),    // ★ 经过 SW3 音乐开关
     .I_acr_valid        (acr_valid),
     .I_acr_cts          (acr_cts),
     .I_acr_n            (acr_n),

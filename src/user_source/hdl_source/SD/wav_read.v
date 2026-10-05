@@ -64,10 +64,12 @@ module wav_read #(
     // 状态编码
     //--------------------------------------------------------------------------
     localparam [2:0] W_IDLE = 3'd0;   // 等待扫描命令
-    localparam [2:0] W_SCAN = 3'd1;   // 逐扇区找 WAV 文件
-    localparam [2:0] W_HDR  = 3'd2;   // 解析文件头
-    localparam [2:0] W_DATA = 3'd3;   // 流式输出 PCM
-    localparam [2:0] W_ERR  = 3'd4;   // 格式不支持，停在错误码
+    localparam [2:0] W_BPB  = 3'd1;   // 读 0 号扇区，判断是 BPB 还是 MBR
+    localparam [2:0] W_SCAN = 3'd2;   // 按簇边界找 WAV 文件
+    localparam [2:0] W_HDR  = 3'd3;   // 解析文件头
+    localparam [2:0] W_DATA = 3'd4;   // 流式输出 PCM
+    localparam [2:0] W_ERR  = 3'd5;   // 格式不支持，停在错误码
+    localparam [2:0] W_BPB2 = 3'd6;   // 读"分区起始扇区"上的真 BPB
 
     reg [2:0] state;
     assign state_code = {1'b0, state};
@@ -87,6 +89,18 @@ module wav_read #(
     // 扫描相关
     //--------------------------------------------------------------------------
     reg [31:0] scan_sector;              // 当前扫描到的扇区
+    reg [7:0]  clu_step;                 // 扫描步长 = 每簇几个扇区
+
+    //--------------------------------------------------------------------------
+    // BPB / MBR 探测用的临时寄存器（详细说明见状态机里的 W_BPB）
+    //   只挑需要的几个字节存下来，所以不需要 512 字节的大缓存
+    //--------------------------------------------------------------------------
+    reg [8:0]  bp_cnt;                        // 扇区内字节计数 0~511
+    reg [7:0]  bp_cs;                         // SecPerClus 候选值
+    reg [7:0]  bp_type;                       // MBR 分区类型（0x0B/0x0C = FAT32）
+    reg [7:0]  bp_l0, bp_l1, bp_l2, bp_l3;    // 分区起始 LBA（小端）
+    reg [7:0]  bp_sg0, bp_sg1;                // MBR 结束标志 0x55 0xAA
+    reg [31:0] part_lba;                      // 分区起始扇区
     reg [5:0]  hdr_cnt;                  // 头部字节计数 0..43
     reg [7:0]  hdr [0:43];               // 44 字节标准 WAV 头缓存
 
@@ -111,6 +125,9 @@ module wav_read #(
         if (rst) begin
             state             <= W_IDLE;
             scan_sector       <= START_SECTOR;
+            clu_step          <= 8'd1;
+            bp_cnt            <= 9'd0;
+            part_lba          <= 32'd0;
             hdr_cnt           <= 6'd0;
             scan_done         <= 1'b0;
             scan_found        <= 1'b0;
@@ -141,7 +158,112 @@ module wav_read #(
                         scan_done    <= 1'b0;
                         scan_found   <= 1'b0;
                         wav_err_code <= E_OK;
-                        state        <= W_SCAN;
+                        state        <= W_BPB;
+                    end
+                end
+
+                //==========================================================
+                //  读 0 号扇区（FAT32 的 BPB），取出"每簇几个扇区"
+                //----------------------------------------------------------
+                //  【为什么需要这一步 —— 这是一个真实踩过的坑】
+                //    WAV 文件可能有 20MB 以上。如果用户最后才把它拷进卡里，
+                //    它可能位于卡上 5 万多个扇区之后。
+                //    逐扇区扫描 = 5 万多次 x 180µs ≈ 10 秒，
+                //    这 10 秒里音频通道一直"告急"，会长期霸占 SD 总线，
+                //    把图片装载活活饿死 ——
+                //    现象就是"换图时黑屏卡好几秒"。
+                //
+                //  【解决办法：按簇边界扫】
+                //    FAT32 里"任何文件的第一个字节一定落在簇边界上"，
+                //    而 RIFF 标记就在文件第一个字节，所以只要扫簇边界即可。
+                //    扫描量直接除以簇大小（典型 64 扇区/簇 → 只要扫 890 次），
+                //    从 10 秒降到 0.2 秒左右。
+                //
+                //  【簇大小从哪来】
+                //    FAT32 的 0 号扇区是 BPB（引导参数块），偏移 13 字节
+                //    就是"每簇几个扇区"(SecPerClus)。
+                //    只认 2 的整数次幂、1~128 的合法值，其它退化成 1。
+                //==========================================================
+                W_BPB: begin
+                    sd_sec_read      <= 1'b1;
+                    sd_sec_read_addr <= 32'd0;
+
+                    // ★ 只挑我们需要的几个字节存下来，不需要 512 字节大缓存：
+                    //     偏移 13     : SecPerClus（每簇几个扇区）—— 超级软盘格式的 BPB
+                    //     偏移 450    : 分区类型（0x0B/0x0C = FAT32）
+                    //     偏移 454~457: 第一个分区的起始 LBA（小端）
+                    //     偏移 510~511: 0x55 0xAA（MBR 结束标志）
+                    if (sd_sec_read_data_valid) begin
+                        case (bp_cnt)
+                            9'd13 : bp_cs   <= sd_sec_read_data;
+                            9'd450: bp_type <= sd_sec_read_data;
+                            9'd454: bp_l0   <= sd_sec_read_data;
+                            9'd455: bp_l1   <= sd_sec_read_data;
+                            9'd456: bp_l2   <= sd_sec_read_data;
+                            9'd457: bp_l3   <= sd_sec_read_data;
+                            9'd510: bp_sg0  <= sd_sec_read_data;
+                            9'd511: bp_sg1  <= sd_sec_read_data;
+                            default: ;
+                        endcase
+                        bp_cnt <= bp_cnt + 9'd1;
+                    end
+
+                    if (sd_sec_read_end) begin
+                        bp_cnt <= 9'd0;
+                        if ((bp_sg0 == 8'h55) && (bp_sg1 == 8'hAA) &&
+                            ((bp_type == 8'h0B) || (bp_type == 8'h0C))) begin
+                            // ---- 0 号扇区是 MBR（分区表）→ 去读分区的 BPB ----
+                            part_lba <= {bp_l3, bp_l2, bp_l1, bp_l0};
+                            state    <= W_BPB2;
+                        end else begin
+                            // ---- 0 号扇区本身就是 BPB（超级软盘格式）----
+                            case (bp_cs)
+                                8'd1, 8'd2, 8'd4, 8'd8,
+                                8'd16, 8'd32, 8'd64, 8'd128: begin
+                                    clu_step    <= bp_cs;
+                                    scan_sector <= {24'd0, bp_cs};
+                                end
+                                default: begin
+                                    clu_step    <= 8'd1;
+                                    scan_sector <= 32'd1;
+                                end
+                            endcase
+                            state <= W_SCAN;
+                        end
+                    end
+                end
+
+                //==========================================================
+                //  读"分区起始扇区"，那才是真正的 BPB
+                //    Windows 格式化 SD 卡会建一个分区表（MBR），
+                //    0 号扇区只放分区表，真正的 BPB 在偏移 454~457 记录的
+                //    那个扇区上（通常是 2048）。不处理这一步，
+                //    取到的簇大小就是垃圾值，只能退化成逐扇区扫描（10 秒）。
+                //==========================================================
+                W_BPB2: begin
+                    sd_sec_read      <= 1'b1;
+                    sd_sec_read_addr <= part_lba;
+
+                    if (sd_sec_read_data_valid) begin
+                        if (bp_cnt == 9'd13) bp_cs <= sd_sec_read_data;
+                        bp_cnt <= bp_cnt + 9'd1;
+                    end
+
+                    if (sd_sec_read_end) begin
+                        bp_cnt <= 9'd0;
+                        case (bp_cs)
+                            8'd1, 8'd2, 8'd4, 8'd8,
+                            8'd16, 8'd32, 8'd64, 8'd128: begin
+                                clu_step    <= bp_cs;
+                                // 从分区的第一个簇边界开始扫
+                                scan_sector <= part_lba + {24'd0, bp_cs};
+                            end
+                            default: begin
+                                clu_step    <= 8'd1;
+                                scan_sector <= part_lba + 32'd1;
+                            end
+                        endcase
+                        state <= W_SCAN;
                     end
                 end
 
@@ -176,7 +298,8 @@ module wav_read #(
                             wav_err_code <= E_NO_FILE;
                             state        <= W_ERR;
                         end else begin
-                            scan_sector <= scan_sector + 32'd1;
+                            // ★ 按"簇"跳，不是按扇区跳（见 W_BPB 的说明）
+                            scan_sector <= scan_sector + {24'd0, clu_step};
                         end
                     end
                 end
@@ -285,7 +408,8 @@ module wav_read #(
                         scan_done    <= 1'b0;
                         scan_found   <= 1'b0;
                         wav_err_code <= E_OK;
-                        state        <= W_SCAN;
+                        // 重新扫描：先回 W_BPB 重新取簇大小，再进 W_SCAN
+                        state        <= W_BPB;
                     end
                 end
 

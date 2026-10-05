@@ -4,9 +4,10 @@
 //  功能    : SD 卡（SPI）总线仲裁器 —— 让"读图片"和"读音乐"共用一条总线
 //------------------------------------------------------------------------------
 //  【为什么需要仲裁】
-//  板子上只有一条 SD 卡 SPI 总线（4 根线），而我们的系统要同时做两件事：
+//  板子上只有一条 SD 卡 SPI 总线（4 根线），而我们的系统要同时做三件事：
 //     ① 读 BMP 图片   （sd_card_bmp，每张 900KB，切图时突发读取）
 //     ② 读 WAV 音乐   （wav_read，持续 192KB/s，必须不间断）
+//     ③ 读 TXT 字幕   （txt_read，只在开机时读一次，几百字节，很快读完）
 //  两个模块都要用同一条总线，所以需要一个"交通警察"来分配使用权。
 //
 //  【为什么仲裁粒度是"一个扇区"】
@@ -16,8 +17,14 @@
 //  【仲裁策略】
 //    音频优先，但要给图片留出足够的连续带宽：
 //      · 音频 FIFO 水位很低（快放完了）→ 音频立刻抢占总线，防止断音
+//      · 否则字幕优先             → 字幕只在开机读 1~2 个扇区，让它赶紧读完
 //      · 否则图片优先             → 图片数据量大，连续读吞吐更高
 //      · 音频 FIFO 还有空间时也给它补一点 → 防止音频长期被饿死
+//
+//    ★ 字幕为什么排在音频"告急"之后、图片之前？
+//      字幕只在开机时读 1~2 个扇区（约 400µs），读完就再也不占总线了。
+//      让它插在图片前面，可以保证"开机后立刻有字幕"，而且代价极小。
+//      但它不能抢在"音频告急"前面，否则极端情况下会断音。
 //
 //    带宽核算（写进设计文档，答辩会问）：
 //      音频需求   : 48000 帧/s × 4 字节 = 192 KB/s = 375 扇区/s
@@ -78,12 +85,27 @@ module sd_bus_arbiter #(
     output wire        wav_sec_read_data_valid,
     output wire        wav_sec_read_end,
 
+    // ---------------- TXT 通道（接 txt_read）----------------
+    input  wire        txt_sec_read,
+    input  wire [31:0] txt_sec_read_addr,
+    output wire [7:0]  txt_sec_read_data,
+    output wire        txt_sec_read_data_valid,
+    output wire        txt_sec_read_end,
+
     // ---------------- 音频 FIFO 水位（写侧时钟域，即本时钟域）----------------
     input  wire [8:0]  wav_fifo_wrusedw,
 
+    // ---------------- WAV 是否已经完成扫描 ----------------
+    //  ★【重要】WAV 扫描期间 FIFO 是空的，如果不加这个门控，
+    //    扫描会被当成"音频告急"，从而长期霸占总线，
+    //    把图片装载活活饿死（现象：换图时黑屏卡好几秒）。
+    //    扫描阶段根本不需要音频数据，所以这时候不许它"告急"。
+    input  wire        wav_scan_done,
+
     // ---------------- 调试输出 ----------------
     output wire        O_grant_bmp,       // 当前授权给图片
-    output wire        O_grant_wav        // 当前授权给音频
+    output wire        O_grant_wav,       // 当前授权给音频
+    output wire        O_grant_txt        // 当前授权给字幕
 );
 
     //--------------------------------------------------------------------------
@@ -92,6 +114,7 @@ module sd_bus_arbiter #(
     localparam [1:0] SEL_NONE = 2'd0;
     localparam [1:0] SEL_BMP  = 2'd1;
     localparam [1:0] SEL_WAV  = 2'd2;
+    localparam [1:0] SEL_TXT  = 2'd3;
 
     // 仲裁状态机
     localparam [1:0] A_IDLE     = 2'd0;   // 空闲，可以接受新请求
@@ -105,7 +128,10 @@ module sd_bus_arbiter #(
     //  第 1 部分：优先级判断（组合逻辑）
     //==========================================================================
     // 音频"告急"：FIFO 水位低于低水位线 → 再不读就要断音了
-    wire wav_urgent = wav_sec_read & (wav_fifo_wrusedw <= WAV_LOW_WM);
+    //   ★ 必须加 wav_scan_done 门控：
+    //     扫描期间 FIFO 天然是空的，会让 wav_urgent 恒为 1，
+    //     于是扫描霸占总线 → 图片装载被饿死 → 换图时黑屏卡住。
+    wire wav_urgent = wav_sec_read & wav_scan_done & (wav_fifo_wrusedw <= WAV_LOW_WM);
 
     // 音频"还想再要点"：FIFO 还没满 → 可以在空闲时补一点
     wire wav_ok     = wav_sec_read & (wav_fifo_wrusedw <  WAV_MAX_WM);
@@ -115,9 +141,11 @@ module sd_bus_arbiter #(
         if (wav_urgent)
             pick = SEL_WAV;        // ① 音频告急 → 绝对优先（保证不断音）
         else if (bmp_sec_read)
-            pick = SEL_BMP;        // ② 否则图片优先（数据量大，连续读吞吐高）
+            pick = SEL_BMP;        // ② 图片优先（数据量大，绝不能被饿死）
+        else if (txt_sec_read)
+            pick = SEL_TXT;        // ③ 图片没需求时再扫字幕（按簇扫，0.2 秒就完）
         else if (wav_ok)
-            pick = SEL_WAV;        // ③ 图片没需求，音频有空间 → 给音频补
+            pick = SEL_WAV;        // ④ 都没需求，音频有空间 → 给音频补
         else
             pick = SEL_NONE;
     end
@@ -144,6 +172,11 @@ module sd_bus_arbiter #(
                     end else if (pick == SEL_WAV) begin
                         grant_sel        <= SEL_WAV;
                         sd_sec_read_addr <= wav_sec_read_addr;
+                        sd_sec_read      <= 1'b1;
+                        a_state          <= A_ACTIVE;
+                    end else if (pick == SEL_TXT) begin
+                        grant_sel        <= SEL_TXT;
+                        sd_sec_read_addr <= txt_sec_read_addr;
                         sd_sec_read      <= 1'b1;
                         a_state          <= A_ACTIVE;
                     end
@@ -176,6 +209,7 @@ module sd_bus_arbiter #(
     // 数据字节可以共享（它只是个值，不会引起副作用）
     assign bmp_sec_read_data = sd_sec_read_data;
     assign wav_sec_read_data = sd_sec_read_data;
+    assign txt_sec_read_data = sd_sec_read_data;
 
     // 但 data_valid 和 end 必须门控！
     //   bmp_read 会对每个 data_valid 累加字节计数，
@@ -186,10 +220,14 @@ module sd_bus_arbiter #(
     assign wav_sec_read_data_valid = sd_sec_read_data_valid & (grant_sel == SEL_WAV);
     assign wav_sec_read_end        = sd_sec_read_end        & (grant_sel == SEL_WAV);
 
+    assign txt_sec_read_data_valid = sd_sec_read_data_valid & (grant_sel == SEL_TXT);
+    assign txt_sec_read_end        = sd_sec_read_end        & (grant_sel == SEL_TXT);
+
     //==========================================================================
     //  第 4 部分：调试输出
     //==========================================================================
     assign O_grant_bmp = (grant_sel == SEL_BMP);
     assign O_grant_wav = (grant_sel == SEL_WAV);
+    assign O_grant_txt = (grant_sel == SEL_TXT);
 
 endmodule
