@@ -28,6 +28,10 @@ module sd_card_bmp #(
     input                       key_next,         // ★ 手动切下一张（单拍脉冲，勿再消抖）
     input                       auto_play_ext,    // ★【改】自动轮播开关（电平），来自拨码开关 SW2
     input  [7:0]                I_period_sec,     // ★【新增】轮播周期（秒），来自 key_ctrl_fsm
+    // ★【新增】画面缩放百分比（50~200，100=原图大小），由 key_ctrl_fsm 经 cfg_cdc 送过来。
+    //   它一变就要"重新装载当前这张图"（因为缩放只能在装载时对像素流做），
+    //   见下面的"缩放值变化 → 重载"逻辑。
+    input  [7:0]                I_zoom_pct,
     output [3:0]                state_code,       // bmp_read 状态码（送数码管）
     input  [15:0]               bmp_width,
     input  [15:0]               bmp_height,
@@ -63,8 +67,16 @@ module sd_card_bmp #(
 wire key_next_press;
 
 // ★【改造】sd_sec_read* / sd_init_done 已提升为模块端口，此处不再声明
-wire             bmp_data_wr_en;
-wire [23:0]      bmp_data;
+// ★【自适应缩放改造】这三条线是 bmp_read 的**原始**输出（未缩放），
+//   先送进 img_scaler 做等比缩放，缩放后的结果才接到 write_en/write_data。
+wire             src_bmp_wr;        // 源图像素有效
+wire [23:0]      src_bmp_data;      // 源图像素颜色
+wire [15:0]      src_img_w;         // 源图宽度
+wire [15:0]      src_img_h;         // 源图高度
+wire             src_frame_start;   // 新图第一个像素
+
+wire             scaled_wr;         // 缩放后的像素有效
+wire [23:0]      scaled_data;       // 缩放后的像素颜色
 wire             bmp_ready;
 wire             scan_done;
 wire             scan_found_valid;
@@ -102,6 +114,14 @@ reg [31:0]       img_sector7;
 reg              next_req_pending;
 reg              load_busy;
 
+// ★【新增】画面缩放：缩放值一变就重载当前图（带 400ms 节流，防按键连发时疯狂重载）
+//   100MHz 下 400ms = 40_000_000 拍，27 位计数器够（最大 1.34 亿）
+localparam [26:0] RELOAD_GAP = 27'd40_000_000;   // 两次重载之间至少隔 400ms
+reg [7:0]        zoom_d;          // 上一拍的缩放值（用来检测变化）
+reg              zoom_pending;    // 1 = 缩放值变过、还没重载
+reg              reload_ok;       // 1 = 允许重载（节流门闩）
+reg [26:0]       reload_cnt;      // 节流计时
+
 // bmp_ready 先表示“源文件读取/送 FIFO 完成”；真正切显示要等 write_finish_toggle 同步后
 reg              source_done_seen;
 
@@ -112,8 +132,9 @@ wire             write_finish_pulse;
 wire auto_tick;
 wire [1:0] next_from_current;
 
-assign write_en   = bmp_data_wr_en;
-assign write_data = {bmp_data[23:16], bmp_data[15:8], bmp_data[7:0], 8'b0};
+// ★【自适应缩放改造】写入帧缓存的像素改为"缩放后"的数据
+assign write_en   = scaled_wr;
+assign write_data = {scaled_data[23:16], scaled_data[15:8], scaled_data[7:0], 8'b0};
 //--------------------------------------------------------------------------
 // ★【改造】自动轮播计时：1 秒节拍 + 秒计数
 //   原来：assign auto_tick = (auto_cnt == (CLK_FREQ_HZ - 1));   // 写死 1 秒
@@ -247,10 +268,36 @@ always @(posedge clk or posedge rst) begin
         load_busy             <= 1'b0;
         source_done_seen      <= 1'b0;
         display_valid         <= 1'b0;
+        zoom_d                <= 8'd100;
+        zoom_pending          <= 1'b0;
+        reload_ok             <= 1'b1;
+        reload_cnt            <= 27'd0;
     end else begin
         wrfin_tgl_sync   <= {wrfin_tgl_sync[1:0], write_finish_toggle};
         scan_start_pulse <= 1'b0;
         load_start_pulse <= 1'b0;
+
+        //------------------------------------------------------------------
+        // ★【新增】缩放值变化检测 + 400ms 节流
+        //   缩放只能在"装载"时对像素流做（显示端是顺序流式读 SDRAM，
+        //   没法随机访问），所以缩放值一变就必须重载当前这张图。
+        //   而按键长按每 150ms 就连发一次，若不节流会疯狂重载
+        //   （一次装载约 350ms），画面会一直卡在装载中 —— 所以节流。
+        //
+        //   zoom_pending：只要值变过就置 1（连发期间不漏记），
+        //                 真正发起重载时才清零 → 松手后画面一定是新比例。
+        //   reload_ok   ：节流门闩，发起重载时清零，400ms 后自动置 1。
+        //------------------------------------------------------------------
+        if (I_zoom_pct != zoom_d)
+            zoom_pending <= 1'b1;
+        zoom_d <= I_zoom_pct;
+
+        if (reload_ok)
+            reload_cnt <= 27'd0;
+        else if (reload_cnt >= RELOAD_GAP)
+            reload_ok  <= 1'b1;
+        else
+            reload_cnt <= reload_cnt + 27'd1;
 
         if (!sd_init_done) begin
             scan_kicked           <= 1'b0;
@@ -356,6 +403,7 @@ always @(posedge clk or posedge rst) begin
                     source_done_seen <= 1'b0;
                     next_req_pending <= 1'b0;
                     auto_sec_cnt     <= 16'd0;
+                    zoom_pending     <= 1'b0;   // ★ 这次装载已经用了最新缩放值
                 end
                 // 手动下一张优先：写到“非当前显示”的另一块 buffer
                 else if (scan_done && bmp_ready && display_valid && !load_busy && next_req_pending && (img_found_count != 3'd0)) begin
@@ -368,6 +416,7 @@ always @(posedge clk or posedge rst) begin
                     source_done_seen <= 1'b0;
                     next_req_pending <= 1'b0;
                     auto_sec_cnt     <= 16'd0;
+                    zoom_pending     <= 1'b0;   // ★ 这次装载已经用了最新缩放值
                 end
                 // 自动播放下一张：同样写到“非当前显示”的另一块 buffer
                 else if (scan_done && bmp_ready && display_valid && !load_busy && auto_play_en && auto_tick && (img_found_count > 3'd1)) begin
@@ -379,6 +428,26 @@ always @(posedge clk or posedge rst) begin
                     load_busy        <= 1'b1;
                     source_done_seen <= 1'b0;
                     auto_sec_cnt     <= 16'd0;
+                    zoom_pending     <= 1'b0;   // ★ 这次装载已经用了最新缩放值
+                end
+                // ★【新增】缩放值变化 → 重载"当前这一张"
+                //   写在"非当前显示"的另一块 buffer 里，显示画面完全不受影响，
+                //   装载完成后由 write_finish_toggle 那一拍统一切换。
+                //   优先级放在自动播放之下：正在换图/轮播时不插队，等空下来再重载。
+                else if (scan_done && bmp_ready && display_valid && !load_busy
+                         && zoom_pending && reload_ok && (img_found_count != 3'd0)) begin
+                    load_idx         <= img_idx;                  // ★ 还是当前这张
+                    load_sector      <= sector_lut(img_idx);
+                    pending_buf_idx  <= next_buf_lut(disp_buf_idx, display_valid);
+                    write_buf_idx    <= next_buf_lut(disp_buf_idx, display_valid);
+                    load_start_pulse <= 1'b1;
+                    load_busy        <= 1'b1;
+                    source_done_seen <= 1'b0;
+                    next_req_pending <= 1'b0;
+                    auto_sec_cnt     <= 16'd0;
+                    zoom_pending     <= 1'b0;   // 已按最新比例重载
+                    reload_ok        <= 1'b0;   // ★ 节流门闩：400ms 内不许再重载
+                    reload_cnt       <= 27'd0;
                 end
             end
         end
@@ -413,8 +482,30 @@ bmp_read bmp_read_m0(
     .sd_sec_read_data       (sd_sec_read_data),
     .sd_sec_read_data_valid (sd_sec_read_data_valid),
     .sd_sec_read_end        (sd_sec_read_end),
-    .bmp_data_wr_en         (bmp_data_wr_en),
-    .bmp_data               (bmp_data)
+    .bmp_data_wr_en         (src_bmp_wr),
+    .bmp_data               (src_bmp_data),
+    .O_img_w                (src_img_w),
+    .O_img_h                (src_img_h),
+    .O_frame_start          (src_frame_start)
+);
+
+//==========================================================================
+//  ★【新增】自适应缩放器（加分项③）
+//    任意尺寸的源图 → 等比缩放到 480 高 → 写进 640x480 帧缓存
+//    比 640 窄的居中补黑，比 640 宽的居中裁掉
+//==========================================================================
+img_scaler u_img_scaler (
+    .clk            (clk),
+    .rst            (rst),
+    .I_wr           (src_bmp_wr),
+    .I_data         (src_bmp_data),
+    .I_w            (src_img_w),
+    .I_h            (src_img_h),
+    .I_frame_start  (src_frame_start),
+    .I_zoom         (I_zoom_pct),     // ★ 缩放百分比（50~200，100=原图大小）
+    .O_wr           (scaled_wr),
+    .O_data         (scaled_data),
+    .O_done         ()
 );
 
 //==========================================================================

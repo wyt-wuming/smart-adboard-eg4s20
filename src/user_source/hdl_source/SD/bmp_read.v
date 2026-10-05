@@ -38,8 +38,13 @@ module bmp_read(
     //   像素流是一维的，缩放器必须知道"一行有多少个像素"才能切行，
     //   以及"一共多少行"才能算纵向缩放比。
     output wire [15:0]          O_img_w,
-    output wire [15:0]          O_img_h
+    output wire [15:0]          O_img_h,
+    output wire                 O_frame_start   // 新图第一个像素（给缩放器复位用）
 );
+
+// 一张图里"第一个有效像素"：像素计数器正好等于像素数据起始偏移的那一拍
+//   （像素有效窗口是 pixel_offset <= cnt < file_len，所以第一拍就是 ==）
+assign O_frame_start = bmp_data_wr_en && (bmp_len_cnt == pixel_offset);
 
 // 把 BOM 头里解析出来的真实宽高送出去（原来只用于"和 640x480 比对"，
 // 现在改成送给缩放器当缩放依据）

@@ -213,6 +213,7 @@ always @(posedge clk or posedge rst_all) begin
 end
 
 wire [7:0] cfg_period_sec;      // 轮播周期（秒）  → 送 sd_card_clk 域
+wire [7:0] cfg_zoom_pct;        // ★ 画面缩放百分比 → 送 sd_card_clk 域（装载用）和 video_clk 域（OSD 显示用）
 wire [4:0] cfg_brightness;      // 亮度 0..31      → 送 video_clk 域
 wire [4:0] cfg_contrast;        // 对比度 0..31    → 送 video_clk 域
 wire       cfg_adj_mode;        // 运行/调节模式   → 送 video_clk 域
@@ -236,6 +237,7 @@ key_ctrl_fsm #(
     .sw_music         (sw3_sync1),
     .sw_osd           (sw4_sync1),
     .O_period_sec     (cfg_period_sec),
+    .O_zoom_pct       (cfg_zoom_pct),   // ★ 画面缩放百分比（50~200）
     .O_brightness     (cfg_brightness),
     .O_contrast       (cfg_contrast),
     .O_adj_sel        (cfg_adj_sel),
@@ -264,6 +266,24 @@ cfg_cdc #(
     .I_clk_dst (sd_card_clk),
     .I_rst_dst (rst_all),
     .O_data    (cfg_period_sec_sd)
+);
+
+//--------------------------------------------------------------------------
+// ★【新增】缩放百分比 → sd_card_clk(100MHz) 域
+//   给 sd_card_bmp 用：缩放值一变，它就重载当前图（见 sd_card_bmp.v）。
+//   和 u_cdc_period 完全一样的办法（多比特配置必须用 cfg_cdc，不能直接连线）。
+//--------------------------------------------------------------------------
+wire [7:0] cfg_zoom_pct_sd;
+
+cfg_cdc #(
+    .WIDTH (8)
+) u_cdc_zoom (
+    .I_clk_src (clk),
+    .I_rst_src (rst_all),
+    .I_data    (cfg_zoom_pct),
+    .I_clk_dst (sd_card_clk),
+    .I_rst_dst (rst_all),
+    .O_data    (cfg_zoom_pct_sd)
 );
 
 // 视频域配置字段分配：
@@ -314,6 +334,23 @@ cfg_cdc #(
     .I_clk_dst (video_clk),
     .I_rst_dst (rst_all),
     .O_data    (cfg_period_sec_v)
+);
+
+//--------------------------------------------------------------------------
+// ★【新增】缩放百分比 → video_clk(25MHz) 域
+//   给 OSD（左上角绿色参数界面）显示"缩放 100"用
+//--------------------------------------------------------------------------
+wire [7:0] cfg_zoom_pct_v;
+
+cfg_cdc #(
+    .WIDTH (8)
+) u_cdc_zoom_v (
+    .I_clk_src (clk),
+    .I_rst_src (rst_all),
+    .I_data    (cfg_zoom_pct),
+    .I_clk_dst (video_clk),
+    .I_rst_dst (rst_all),
+    .O_data    (cfg_zoom_pct_v)
 );
 
 //--------------------------------------------------------------------------
@@ -407,6 +444,7 @@ sd_card_bmp #(
     .key_next          (key_next_pulse),
     .auto_play_ext     (cfg_auto_play_sd),    // ★ 自动轮播开关（拨码开关 SW2，电平信号）
     .I_period_sec      (cfg_period_sec_sd),   // ★ 轮播周期（可配置）
+    .I_zoom_pct        (cfg_zoom_pct_sd),     // ★ 画面缩放百分比（变了就重载当前图）
     .state_code        (state_code),
     .bmp_width         (16'd640),
     .bmp_height        (16'd480),
@@ -705,10 +743,16 @@ audio_player #(
 //  ★ 注意：seg_scan 工作在 50MHz 的 clk 域，所以这里取用的配置参数
 //    必须也是 clk 域的信号（cfg_* 而不是 vcfg_*），避免跨时钟域采样。
 // =========================================================================
+// ★ 缩放是三位数（50~200），但数码管只有两位 —— 所以显示"百分比 / 10"：
+//     50 → 05      100 → 10      200 → 20
+//   位 3 显示 4 表示"这是缩放项，读数是 ×10"（见 seg_display.v 的版面说明）
+wire [7:0] seg_zoom_10 = cfg_zoom_pct / 8'd10;
+
 wire [15:0] seg_value = cfg_adj_mode
                       ? ((cfg_adj_sel == 2'd0) ? {11'd0, cfg_brightness} :
                          (cfg_adj_sel == 2'd1) ? {11'd0, cfg_contrast}   :
-                                                  {8'd0,  cfg_period_sec})
+                         (cfg_adj_sel == 2'd2) ? {8'd0,  cfg_period_sec} :
+                                                 {8'd0,  seg_zoom_10})
                       : {8'd0, cfg_period_sec};
 
 // auto_play_en 来自 sd_card_clk(100MHz) 域，这里打两拍同步到 clk 域再用
@@ -899,10 +943,11 @@ fade_ctrl u_fade_ctrl (
 wire [23:0] vout_osd;
 wire        hs_osd, vs_osd, de_osd;
 
-// 当前要显示的数值：按当前调节项从三个参数里选一个
+// 当前要显示的数值：按当前调节项从四个参数里选一个
 wire [15:0] osd_value = (vcfg_adj_sel == 2'd0) ? {11'd0, vcfg_brightness} :  // 亮度
                         (vcfg_adj_sel == 2'd1) ? {11'd0, vcfg_contrast}   :  // 对比度
-                                                 {8'd0,  cfg_period_sec_v};   // 周期
+                        (vcfg_adj_sel == 2'd2) ? {8'd0,  cfg_period_sec_v} : // 周期
+                                                 {8'd0,  cfg_zoom_pct_v};    // ★ 缩放（50~200）
 
 osd_adjust u_osd_adjust (
     .video_clk (video_clk),

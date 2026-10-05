@@ -84,6 +84,9 @@ module key_ctrl_fsm #(
     // ★ O_period_sec 必须用 wire：它是被下面 assign 连续赋值的。
     //   如果写成 output reg，TD 会报 HDL-8007 语法错误。
     output wire [7:0] O_period_sec,      // 轮播周期（秒），0~30 连续可调
+
+    // ★【新增】画面缩放百分比（100 = 原图大小，50~200 可调）
+    output wire [7:0] O_zoom_pct,
     output reg  [4:0] O_brightness,      // 亮度 0..31（16=中性）
     output reg  [4:0] O_contrast,        // 对比度 0..31（16=中性）
     output reg  [1:0] O_adj_sel,         // 当前调节项 0=亮度 1=对比度 2=周期
@@ -123,6 +126,15 @@ module key_ctrl_fsm #(
     localparam [1:0] SEL_BRI = 2'd0;
     localparam [1:0] SEL_CON = 2'd1;
     localparam [1:0] SEL_PER = 2'd2;
+    localparam [1:0] SEL_ZOOM= 2'd3;   // ★ 新增：第 4 个调节项 —— 画面缩放
+
+    //  ★【新增】画面缩放百分比
+    //    100% = 原图大小；缩小则四周补黑；放大则超出部分直接切掉
+    //    50% ~ 200%，步长 5%，共 31 档
+    localparam [7:0] ZOOM_MIN  = 8'd50;
+    localparam [7:0] ZOOM_MAX  = 8'd200;
+    localparam [7:0] ZOOM_DEF  = 8'd100;
+    localparam [7:0] ZOOM_STEP = 8'd5;
 
     //==========================================================================
     //  第 1 部分：例化两个按键事件解析器（消抖 + 短按/长按/连发）
@@ -207,7 +219,11 @@ module key_ctrl_fsm #(
 
     reg [7:0] period_val;                 // 当前周期值（秒），范围 0~30
 
+    // ★【新增】画面缩放百分比 50~200
+    reg [7:0] zoom_val;
+
     assign O_period_sec = period_val;
+    assign O_zoom_pct   = zoom_val;
 
     //==========================================================================
     //  第 3 部分：参数增减任务（用 task 让主逻辑更简洁易懂）
@@ -221,9 +237,13 @@ module key_ctrl_fsm #(
                 SEL_CON: begin
                     if (O_contrast < CON_MAX) O_contrast <= O_contrast + 5'd1;
                 end
-                default: begin                    // SEL_PER：周期 +1 秒（到 30 回 0）
+                SEL_PER: begin                    // 周期 +1 秒（到 30 回 0）
                     if (period_val < PER_MAX) period_val <= period_val + 8'd1;
                     else                      period_val <= PER_MIN;
+                end
+                default: begin                    // SEL_ZOOM：缩放 +5%（到 200 回 50）
+                    if (zoom_val < ZOOM_MAX) zoom_val <= zoom_val + ZOOM_STEP;
+                    else                     zoom_val <= ZOOM_MIN;
                 end
             endcase
         end
@@ -238,9 +258,13 @@ module key_ctrl_fsm #(
                 SEL_CON: begin
                     if (O_contrast > CON_MIN) O_contrast <= O_contrast - 5'd1;
                 end
-                default: begin                    // SEL_PER：周期 -1 秒（到 0 回 30）
+                SEL_PER: begin                    // 周期 -1 秒（到 0 回 30）
                     if (period_val > PER_MIN) period_val <= period_val - 8'd1;
                     else                      period_val <= PER_MAX;
+                end
+                default: begin                    // SEL_ZOOM：缩放 -5%（到 50 回 200）
+                    if (zoom_val > ZOOM_MIN) zoom_val <= zoom_val - ZOOM_STEP;
+                    else                     zoom_val <= ZOOM_MAX;
                 end
             endcase
         end
@@ -252,6 +276,7 @@ module key_ctrl_fsm #(
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             period_val       <= PER_DEF;     // 默认 5 秒
+            zoom_val         <= ZOOM_DEF;    // ★ 默认 100%（原图大小）
             O_brightness     <= BRI_MID;     // 默认中性
             O_contrast       <= CON_MID;     // 默认中性
             O_adj_sel        <= SEL_BRI;     // 默认调节亮度
@@ -273,7 +298,8 @@ module key_ctrl_fsm #(
             end else begin
                 // ---- 调节模式 ----
                 if (k1_press)
-                    O_adj_sel <= (O_adj_sel == SEL_PER) ? SEL_BRI : (O_adj_sel + 2'd1);
+                    // 4 项循环：亮度 → 对比度 → 周期 → 缩放 → 亮度
+                    O_adj_sel <= (O_adj_sel == SEL_ZOOM) ? SEL_BRI : (O_adj_sel + 2'd1);
             end
 
             //==================================================================
