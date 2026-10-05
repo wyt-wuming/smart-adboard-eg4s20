@@ -295,7 +295,24 @@ wire [4:0] vcfg_contrast   = cfg_video[10:6];
 wire       vcfg_adj_mode   = cfg_video[5];
 wire [1:0] vcfg_adj_sel    = cfg_video[4:3];
 wire       vcfg_fade_en    = cfg_video[2];   // 转场开关（阶段 3 使用）
-wire       vcfg_osd_en     = cfg_video[1];   // OSD 开关（阶段 1e 使用）
+wire       vcfg_osd_en     = cfg_video[1];   // OSD 开关
+
+//--------------------------------------------------------------------------
+// 轮播周期数值也要送到 video_clk 域 —— 给 OSD 显示"周期 05秒"用
+//   （period_sec 本来只送到 sd_card_clk 域给 sd_card_bmp，OSD 还需要一份）
+//--------------------------------------------------------------------------
+wire [7:0] cfg_period_sec_v;
+
+cfg_cdc #(
+    .WIDTH (8)
+) u_cdc_period_v (
+    .I_clk_src (clk),
+    .I_rst_src (rst_all),
+    .I_data    (cfg_period_sec),
+    .I_clk_dst (video_clk),
+    .I_rst_dst (rst_all),
+    .O_data    (cfg_period_sec_v)
+);
 
 //--------------------------------------------------------------------------
 // 自动轮播开关（SW2）也要跨到 sd_card_clk(100MHz) 域，给 sd_card_bmp 用
@@ -714,7 +731,46 @@ image_processor u_image_processor (
     .I_contrast   (vcfg_contrast)
 );
 
-assign vout_data = vout_proc;
+// =========================================================================
+//  图像处理流水线（第 2 级）：OSD 调节界面
+// -------------------------------------------------------------------------
+//  只在"调节模式"（拨码 SW1 = ON）时，在屏幕左上角用绿色汉字+数字
+//  显示当前正在调节的参数和数值；平时完全透明、不影响画面。
+//
+//  显示内容示例：
+//      亮度   16
+//      对比度 24
+//      周期   05秒
+//
+//  数据流：vout_proc → [osd_adjust] → vout_osd → vout_data → AXIS → HDMI
+//  ★ 本模块内部把像素和 hs/vs/de 都延迟 2 拍，所以下游必须用它输出的
+//    de_osd / vs_osd，不能再用 de_proc / vs_proc。
+// =========================================================================
+wire [23:0] vout_osd;
+wire        hs_osd, vs_osd, de_osd;
+
+// 当前要显示的数值：按当前调节项从三个参数里选一个
+wire [15:0] osd_value = (vcfg_adj_sel == 2'd0) ? {11'd0, vcfg_brightness} :  // 亮度
+                        (vcfg_adj_sel == 2'd1) ? {11'd0, vcfg_contrast}   :  // 对比度
+                                                 {8'd0,  cfg_period_sec_v};   // 周期
+
+osd_adjust u_osd_adjust (
+    .video_clk (video_clk),
+    .rst       (rst_all),
+    .I_de      (de_proc),
+    .I_hs      (hs_proc),
+    .I_vs      (vs_proc),
+    .I_rgb     (vout_proc),
+    .O_de      (de_osd),
+    .O_hs      (hs_osd),
+    .O_vs      (vs_osd),
+    .O_rgb     (vout_osd),
+    .I_show    (vcfg_adj_mode),      // ★ 只有调节模式才显示
+    .I_sel     (vcfg_adj_sel),
+    .I_value   (osd_value)
+);
+
+assign vout_data = vout_osd;
 
 frame_read_write #(
     .WRITE_V_FLIP     (1),
@@ -802,13 +858,13 @@ audio_arc_calculate #(
 );
 
 // ===================== RGB/DE 转 AXIS 视频 =====================
-// ★ 注意：I_vs / I_de 必须接图像处理流水线输出后的 vs_proc / de_proc，
-//    它们与 vout_data 严格同拍；若接原始的 vs / de 会导致画面偏移或撕裂。
+// ★ 注意：I_vs / I_de 必须接图像处理流水线最后一级输出的 vs_osd / de_osd，
+//    它们与 vout_data 严格同拍；若接前面几级的信号会导致画面偏移或撕裂。
 video_rgb_to_axis_640x480 u_video_rgb_to_axis_640x480(
     .I_clk         (video_clk),
     .I_rst         (rst_all),
-    .I_vs          (vs_proc),
-    .I_de          (de_proc),
+    .I_vs          (vs_osd),
+    .I_de          (de_osd),
     .I_rgb         (vout_data),
     .O_video_user  (axis_s_user),
     .O_video_valid (axis_s_valid),
