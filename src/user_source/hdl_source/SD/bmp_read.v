@@ -32,8 +32,19 @@ module bmp_read(
     input                       sd_sec_read_end,
 
     output reg                  bmp_data_wr_en,
-    output reg [23:0]           bmp_data
+    output reg [23:0]           bmp_data,
+
+    // ---------------- ★【新增】源图真实尺寸（给 img_scaler 用）----------------
+    //   像素流是一维的，缩放器必须知道"一行有多少个像素"才能切行，
+    //   以及"一共多少行"才能算纵向缩放比。
+    output wire [15:0]          O_img_w,
+    output wire [15:0]          O_img_h
 );
+
+// 把 BOM 头里解析出来的真实宽高送出去（原来只用于"和 640x480 比对"，
+// 现在改成送给缩放器当缩放依据）
+assign O_img_w = width[15:0];
+assign O_img_h = height[15:0];
 
 localparam ST_IDLE      = 3'd0;
 localparam ST_SCAN      = 3'd1;
@@ -65,12 +76,21 @@ wire [31:0] next_scan_sector_if_match;
 wire [31:0] next_scan_sector_if_miss;
 
 assign ready = (state == ST_IDLE);
+// ★【自适应缩放改造】原来这里要求"宽高必须正好等于 640x480"，
+//   不符合的图直接跳过。现在改成"接受任意尺寸"，由下游 img_scaler
+//   负责等比缩放到 480 高。这里只保留几条底线：
+//     ① 必须是标准 24 位、无压缩的 BMP
+//     ② 宽高要在合理范围内（行缓存 2048 深，超了装不下）
+//   ★ 顺带一提：用无符号比较"<= 2048"还能顺便挡掉"自下而上"格式
+//     把高度写成负数的情况（负数的低 32 位会是个天文数字，必然超限）。
 assign header_match = (header_0 == "B") &&
                       (header_1 == "M") &&
-                      (width[15:0]  == bmp_width) &&
-                      (height[15:0] == bmp_height) &&
                       (bit_count    == 16'd24) &&
-                      (compression  == 32'd0);
+                      (compression  == 32'd0) &&
+                      (width        <= 32'd2048) &&
+                      (height       <= 32'd2048) &&
+                      (width        != 32'd0) &&
+                      (height       != 32'd0);
 assign bmp_data_valid = (sd_sec_read_data_valid == 1'b1) &&
                         (bmp_len_cnt >= pixel_offset) &&
                         (bmp_len_cnt <  file_len);
