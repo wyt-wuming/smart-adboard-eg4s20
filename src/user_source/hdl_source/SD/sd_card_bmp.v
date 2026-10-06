@@ -155,8 +155,13 @@ localparam [26:0] ZOOM_QUIET_GAP = 27'd50_000_000;   // 500ms 静默 @100MHz
 //   → 重载永远不发起 → 画面死卡（系统空闲，数码管位5=1），
 //   松手后 500ms 静默 + 一次装载才突然跳到目标，体感"坏掉"。
 //   兜底：zoom_pending 置 1 后单独计时，连按不清零；
-//   满 800ms 还没能重载就强制用当前值刷一次 → 画面慢半拍跟手。
-localparam [26:0] ZOOM_FORCE_GAP = 27'd80_000_000;   // 连按 800ms 强制刷新 @100MHz
+//   满 400ms 还没能重载就强制用当前值刷一次。
+//   节奏推算：装载 350ms（期间连发把 force 重新计时）+ 400ms 兜底
+//   ≈ 550ms 刷一档，每档约 3~4 个步长（18%），画面慢半拍跟手。
+//   为什么 400ms 而不是更小：reload_ok 节流本身就是 400ms，再小也快不了；
+//   且 SD 卡被图片占用 64% 时，音频靠扇区级仲裁的"告急插队"
+//   （sd_bus_arbiter wav_urgent，每个扇区 184µs 后就轮得到）不会断音。
+localparam [26:0] ZOOM_FORCE_GAP = 27'd40_000_000;   // 连按 400ms 强制刷新 @100MHz
 reg [26:0]       zoom_quiet;      // 距上次缩放值变化过了多久
 reg [26:0]       zoom_force_cnt;  // ★ zoom_pending 已持续多久（连按不清零）
 reg [7:0]        zoom_d;          // 上一拍的缩放值（用来检测变化）
@@ -515,7 +520,7 @@ always @(posedge clk or posedge rst) begin
                 else if (scan_done && bmp_ready && display_valid && !load_busy
                          && zoom_pending && reload_ok
                          && ((zoom_quiet >= ZOOM_QUIET_GAP)          // ★ 等用户停手 500ms
-                             || (zoom_force_cnt >= ZOOM_FORCE_GAP))  // ★ 或连按 800ms 强制刷新
+                             || (zoom_force_cnt >= ZOOM_FORCE_GAP))  // ★ 或连按 400ms 强制刷新
                          && (img_found_count != 3'd0)) begin
                     load_idx         <= img_idx;                  // ★ 还是当前这张
                     load_sector      <= sector_lut(img_idx);

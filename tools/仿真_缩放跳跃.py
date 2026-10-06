@@ -7,7 +7,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 ==============================================================================
  文件名 : 仿真_缩放跳跃.py
  功能   : 逐拍仿真 sd_card_bmp.v 的"缩放重载决策逻辑"
-          （★ 含 500ms 静默期 + 800ms 强制刷新兜底，即 2026-10-06 修复后的当前 RTL）
+          （★ 含 500ms 静默期 + 400ms 强制刷新兜底，即 2026-10-06 修复后的当前 RTL）
           排查现象："按住连按几十下 → 画面卡住不动 → 数码管位5=1（空闲）→
                     等很久才到达目标缩放大小"
 ------------------------------------------------------------------------------
@@ -15,11 +15,11 @@ if hasattr(sys.stdout, 'reconfigure'):
    ① 变化检测  ：I_zoom_pct != zoom_d → zoom_pending=1、zoom_quiet=0
    ② 静默计时  ：数值稳定时 zoom_quiet 递增，满 500ms 才允许重载
    ③ 强制兜底  ：zoom_force_cnt 随 pending 持续计时（连按不清零），
-                  满 800ms 还没重载就强制刷一次
+                  满 400ms 还没重载就强制刷一次
    ④ 节流门闩  ：reload_ok，发起重载后 400ms 内不允许再重载
    ⑤ 重载分支  ：scan_done & bmp_ready & display_valid & !load_busy
                   & zoom_pending & reload_ok
-                  & (zoom_quiet>=500ms || zoom_force_cnt>=800ms)
+                  & (zoom_quiet>=500ms || zoom_force_cnt>=400ms)
                   & img_found_count != 0
    ⑥ 装载耗时  ：350ms（一次 BMP 装载，期间 bmp_ready=0）
 
@@ -34,7 +34,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 GAP_MS = 400          # 两次重载最小间隔（RELOAD_GAP，@100MHz = 40M 拍）
 QUIET_MS = 500        # 缩放值静默期（ZOOM_QUIET_GAP = 50M 拍）
-FORCE_MS = 800        # 连按强制刷新兜底（ZOOM_FORCE_GAP = 80M 拍）
+FORCE_MS = 400        # 连按强制刷新兜底（ZOOM_FORCE_GAP = 40M 拍，2026-10-06 由 800 缩短）
 LOAD_MS = 350         # 一次 BMP 装载耗时（实测约 350ms）
 REPEAT_MS = 150       # 按键长按连发间隔（key_press_event REPEAT_MS）
 STEP_PCT = 5          # 每按一下缩放变化 ±5%（key_ctrl_fsm ZOOM_STEP）
@@ -165,18 +165,18 @@ def case(name, changes, t_end, want_n, want_last, idle_hold_ge_ms=0,
 
 
 print('=' * 70)
-print('  缩放重载决策逻辑仿真（★ 含 500ms 静默期 + 800ms 强制刷新兜底）')
+print('  缩放重载决策逻辑仿真（★ 含 500ms 静默期 + 400ms 强制刷新兜底）')
 print('  时间刻度 1ms；对应 2026-10-06 修复后的 sd_card_bmp.v')
 print('=' * 70)
 print()
 
 # ---------------------------------------------------------------- 场景 1
 # 原 bug 场景：按住 4.5 秒（每 150ms 连发一次，100%→200% 共 20 下），松手
-# 修复后：按住期间强制刷新兜底 → 画面每约 1.15s 跟一档，松手 ≤850ms 到位
+# 修复后（兜底 400ms）：画面每约 450ms 跟一档（每档 15%），松手 ~750ms 到位
 s1 = {1000 + i * REPEAT_MS: 100 + (i + 1) * STEP_PCT for i in range(20)}
 case('场景 1：按住 4.5s 连按 20 下（100%→200%），修复后画面跟手',
-     s1, 12000, want_n=4, want_last=200,
-     want_mid=[130, 160, 190, 200], max_gap_ms=1200)
+     s1, 12000, want_n=7, want_last=200,
+     want_mid=[115, 130, 145, 160, 175, 190, 200], max_gap_ms=800)
 
 # ---------------------------------------------------------------- 场景 2
 # 小步长对照：按一下停 3 秒，共 3 下 → 每次都跟手重载
@@ -185,12 +185,12 @@ case('场景 2（对照）：小步长，按一下停 3 秒 ×3 下（105/110/11
 
 # ---------------------------------------------------------------- 场景 3
 # 中途停顿：按住 8 下 → 停 700ms → 再按住 8 下 → 松手
-# 修复后：第一轮按住时 800ms 兜底刷一次中间值(130)，停顿期静默刷 140，
-#         第二轮再兜底刷 170，松手后静默刷 180。画面经历 100→130→140→170→180。
+# 修复后：两轮按住都靠 400ms 兜底连续跟档，停顿期静默刷 140，
+#         画面经历 100→115→130→140→155→170→180，最终 180 ✓
 s3 = {1000 + i * REPEAT_MS: 100 + (i + 1) * STEP_PCT for i in range(8)}
 s3.update({3250 + i * REPEAT_MS: 140 + (i + 1) * STEP_PCT for i in range(8)})
 case('场景 3：按住 8 下(→140) → 停 700ms → 按住 8 下(→180) → 松手',
-     s3, 8000, want_n=4, want_last=180, want_mid=[130, 140, 170, 180])
+     s3, 8000, want_n=6, want_last=180, want_mid=[115, 130, 140, 155, 170, 180])
 
 # ---------------------------------------------------------------- 场景 4
 # 装载期间又按：重载发起后 200ms（装载 350ms 还没完）再按一下
@@ -213,18 +213,21 @@ paint_trace(s1, r1, 12000)
 
 print()
 print('=' * 70)
-print('  对照：三个版本的场景 1 行为')
+print('  对照：四个版本的场景 1 行为')
 print('=' * 70)
 r_none, _ = sim(s1, 12000, quiet_enable=False)     # 版本 A：加静默期之前
 r_quiet, _ = sim(s1, 12000, force_gap_ms=None)     # 版本 B：只挡不兜（本次排查的 bug）
-r_fix, _ = sim(s1, 12000)                          # 版本 C：当前 RTL（静默+兜底）
+r_fix8, _ = sim(s1, 12000, force_gap_ms=800)       # 版本 C：兜底 800ms（初版修复，用户嫌慢）
+r_fix, _ = sim(s1, 12000)                          # 版本 D：当前 RTL（兜底 400ms）
 print('  版本 A 无静默（最早）      ：%d 次重载，装载总耗时 %dms —— 按住 4500ms 里疯狂重载'
       % (len(r_none), len(r_none) * LOAD_MS))
 print('  版本 B 只挡不兜（2026-10-06 初版静默）：%d 次重载 —— 按住期间画面死卡 4.5s'
       % len(r_quiet))
-print('  版本 C 静默+800ms 兜底（当前 RTL）：%d 次重载：%s'
+print('  版本 C 兜底 800ms（初版修复）：%d 次重载，约 900ms/档 —— 用户仍嫌延迟大'
+      % len(r_fix8))
+print('  版本 D 兜底 400ms（当前 RTL）：%d 次重载：%s'
       % (len(r_fix), ', '.join('%dms→%d%%' % (t, v) for t, v in r_fix)))
-print('  → C 按住期间画面每约 1.15s 跟一档，松手后 ≤850ms 到达精确目标。')
+print('  → D 按住期间画面约 450ms 跟一档，松手后 ~750ms 到达精确目标。')
 print()
 
 print('=' * 70)
