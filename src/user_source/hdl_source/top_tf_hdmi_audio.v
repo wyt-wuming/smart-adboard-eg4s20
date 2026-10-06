@@ -1,16 +1,79 @@
+//==============================================================================
+//  文件名  : top_tf_hdmi_audio.v
+//  模块名  : top —— 工程顶层（TD 工程 Top Module）
+//  功能    : 智能数字广告牌系统顶层：TF 卡读图/读乐，HDMI 显示 + 音乐 + 字幕
+//------------------------------------------------------------------------------
+//  【系统一句话】
+//    从 TF 卡读取 BMP 广告图（自动扫描）和 WAV 背景音乐，在 HDMI 显示器上
+//    轮播显示，支持：字幕传送带、换图转场、亮度/对比度调节、画面缩放 50%~200%。
+//
+//  【模块层次总览】★ = 本作品新增/改造的模块
+//
+//   top
+//   ├─① 时钟与复位
+//   │   ├── sys_pll                    sd_card_clk 100M / ext_mem_clk 125M(含相移)
+//   │   ├── video_pll                  video_clk 25M / hdmi_5x_clk 125M
+//   │   └── PLL_HDMI_AUDIO             audio_mclk 12.288M（仅为维持 lock，见下方说明）
+//   │
+//   ├─② 人机交互（clk 50MHz 域）
+//   │   ├── key_ctrl_fsm            ★  4 拨码 + 3 按键 → 全部配置参数
+//   │   └── cfg_cdc × 5             ★  配置跨时钟域（翻转握手）
+//   │
+//   ├─③ SD 卡存储子系统（sd_card_clk 100MHz 域）—— 合规核心：一条 SPI 总线三级仲裁
+//   │   ├── sd_card_top                SPI 物理层（全工程唯一实例）
+//   │   ├── sd_bus_arbiter          ★  仲裁：音频告急 > 字幕 > 图片 > 音频补货
+//   │   ├── sd_card_bmp             ★  图片通道（扫描/装载/轮播/双缓冲调度）
+//   │   │   ├── bmp_read            ★  扫描 + 读任意尺寸 BMP
+//   │   │   ├── img_scaler          ★  自适应等比缩放（50%~200%，中心基准）
+//   │   │   └── frame_fifo_write       写帧缓存 FIFO
+//   │   ├── wav_read                ★  音乐通道（WAV 扫描 + 流式 PCM）
+//   │   ├── txt_read                ★  字幕通道（UTF-8 → 字库索引）
+//   │   ├── rfifo_32_32_512            音频异步 FIFO（100M 写 / 25M 读，FWFT）
+//   │   └── seg_display / seg_scan / seg_decoder    数码管显示
+//   │
+//   ├─④ 帧缓存（ext_mem_clk 125MHz 域）
+//   │   ├── frame_read_write           双缓冲（BUF0=0 / BUF1=307200）
+//   │   └── sdram                      片内 8MB SDRAM
+//   │
+//   ├─⑤ 视频流水线（video_clk 25MHz 域）★ 每级都用 video_sync_delay 补齐延迟
+//   │   ├── video_timing_data          产生 640×480@60Hz 时序
+//   │   ├── video_delay                读 SDRAM 数据对齐
+//   │   ├── image_processor         ★  亮度/对比度        （延迟 2 拍）
+//   │   ├── fade_ctrl               ★  栅格化转场         （延迟 2 拍）
+//   │   ├── osd_adjust              ★  左上角参数 OSD     （延迟 2 拍）
+//   │   └── marquee_osd             ★  底部字幕传送带     （延迟 4 拍）
+//   │
+//   ├─⑥ 音频通路
+//   │   ├── audio_player            ★  48kHz 节拍 + underrun 补静音
+//   │   └── audio_arc_calculate        ACR 的 CTS/N 计算
+//   │
+//   └─⑦ HDMI 输出
+//       ├── video_rgb_to_axis_640x480  RGB → AXIS 视频流
+//       ├── hdmi_1_4b_transmitter_core_wrapper    视频/音频打包（加密 IP）
+//       └── hdmi_phy_wrapper + lane_lvds_10_1     TMDS 串行化 → HDMI 引脚
+//
+//  【★ 改代码前必读的三条铁律】
+//    1. 视频流水线每插一级，必须用 video_sync_delay 补齐同样的延迟拍数，
+//       数字数错 → 画面左右偏移 / AXIS 撕裂。
+//    2. 任何信号必须在"第一次使用之前"声明，否则会被当成 1 位隐式线网
+//       （HDL-7225），地址/数据被截断 → 功能完全失效。
+//    3. 配置参数跨时钟域：多比特走 cfg_cdc（翻转握手），单比特打 2 拍。
+//------------------------------------------------------------------------------
+//  所属工程: 基于安路 EG4S20 的智能数字广告牌系统（赛题一 · 2026）
+//==============================================================================
 
 module top(
-    input                       clk,
-    input                       rst_n,
-    input                       key1,           // 按键 KEY_3（引脚 B1）切图 / 切换调节项
-    input                       key2,           // 按键 KEY_4（引脚 C1）周期+ / 参数+
-    input                       key3,           // ★【新增】按键 KEY_2（引脚 B2）减键
+    input                       clk,            // 板载 50MHz 晶振（引脚 R7）
+    input                       rst_n,          // 复位（KEY_1，引脚 A2，低有效）
+    input                       key1,           // KEY_3 → B1：切图 / 切换调节项
+    input                       key2,           // KEY_4 → C1：周期+ / 参数+
+    input                       key3,           // KEY_2 → B2：周期− / 参数−
 
-    // ---- ★【新增】4 个拨码开关（引脚从 HX4S20C 原理图查得）----
-    //   SW1 → C8 ：工作模式 / 调节模式
-    //   SW2 → C7 ：自动轮播 / 固定
-    //   SW3 → C6 ：淡入淡出转场 / 硬切
-    //   SW4 → C5 ：显示 OSD / 隐藏 OSD
+    // ---- 4 个拨码开关（引脚从 HX4S20C 原理图查得）----
+    //   SW1 → C8 ：ON = 调节模式        OFF = 工作模式
+    //   SW2 → C7 ：ON = 自动轮播        OFF = 固定当前图
+    //   SW3 → C6 ：ON = 播放音乐        OFF = 静音
+    //   SW4 → C5 ：ON = 显示底部字幕    OFF = 隐藏字幕
     input                       sw1,
     input                       sw2,
     input                       sw3,
@@ -93,14 +156,11 @@ wire vs_0;
 wire de_0;
 
 // HDMI 1.4b 音频发射相关
-wire        audio_pll_lock;
+wire        audio_pll_lock;  // 音频 PLL 锁定标志（参与 rst_all 复位）
 wire        audio_mclk;      // 音频 PLL 输出的 12.288MHz
-// ★【改造】原 I2S 测试音相关信号(audio_i2s_bclk/lrck/dout)和
-//   解串后的 audio_valid/audio_left_data/audio_right_data 已全部删除。
-//   音频数据现在来自 TF 卡（见下方"音频子系统"）。
-//   注意：audio_mclk 虽然不再参与音频通路，但仍需保留一个"消费者"，
-//   否则综合工具会把这个 PLL 优化掉，进而让 audio_pll_lock 变成常量、
-//   影响 rst_all 复位逻辑（见下面的 audio_clk_alive 计数器）。
+// ★ audio_mclk 不参与音频通路（音频数据来自 TF 卡，见下方"音频子系统"），
+//   但必须保留一个"消费者"（见下面的 audio_clk_alive 计数器），否则综合工具
+//   会把 PLL 优化掉 → audio_pll_lock 变成常量 → rst_all 复位逻辑失效。
 wire        acr_valid;
 wire [19:0] acr_cts;
 wire [19:0] acr_n;
@@ -111,18 +171,70 @@ wire        axis_s_last;
 wire [23:0] axis_s_data;
 wire        axis_s_ready;
 
-wire        edid_trig;
-wire        edid_valid;
-wire [7:0]  edid_data;
+wire        edid_trig;      // 上电触发一次 EDID 读取（读取结果当前不使用）
 
 wire [9:0]  tmds_ch0_data;
 wire [9:0]  tmds_ch1_data;
 wire [9:0]  tmds_ch2_data;
 wire [9:0]  tmds_clk_data;
 
-// 统一复位：TF 图像链路 + HDMI 音频链路
+//--------------------------------------------------------------------------
+//  统一复位：TF 图像链路 + HDMI 音频链路
+//
+//  ★ 2026-10-06 修正：audio_pll_lock 原来是"直接"参与复位的。
+//    PLL 的 lock 信号在电源波动 / 负载突变时会出现**瞬时毛刺**
+//    （几十 ns 的低电平），那一下就会把整个系统复位掉。
+//    反复大动作（连续多次调整缩放、连续重载图片）时更容易触发，表现为：
+//      画面卡住不动、数码管最左位变成 0（= sd_init_done=0）、按键全无反应
+//    —— 系统被复位后 SD 卡没能重新初始化成功。
+//
+//    现在加滤波：lock 持续为低超过 1ms 才认为是"真的失锁"；
+//    上电时只要 lock 一拉高就立即放行（保持原来的上电行为不变）。
+//--------------------------------------------------------------------------
+//--------------------------------------------------------------------------
+//  ★ 2026-10-06 修正二：rst_n（KEY_1 引脚）也要消抖
+//    上一版把 PLL 的 lock 滤波之后，系统仍会在"连续大动作"时被复位 ——
+//    排除法只剩一个复位源：rst_n 本身。
+//    KEY_1 是机械按键，引脚 A2 上直接进 FPGA，**没有任何消抖**：
+//    连续重载图片时电流突变，引脚上的噪声会被当成"按下了复位键"，
+//    直接复位整个系统（表现：画面黑掉卡住 → 很久之后 SD 卡才缓过来）。
+//    这里加 20ms 消抖：真按住不放才会复位，噪声一律忽略。
+//    （消抖只在 clk 上做，不受 rst_all 影响，避免自锁）
+//--------------------------------------------------------------------------
+reg [19:0] rstn_cnt;                    // 20 位：连续为低 20ms 才认账 @50MHz
+reg        rst_n_f;                     // 消抖后的复位（低有效）
+
+always @(posedge clk) begin
+    if (rst_n == 1'b0) begin
+        if (rstn_cnt < 20'hFFFFF)
+            rstn_cnt <= rstn_cnt + 20'd1;
+        else
+            rst_n_f <= 1'b0;            // 持续为低 → 确认是真按下
+    end else begin
+        rstn_cnt <= 20'd0;
+        rst_n_f  <= 1'b1;               // 一恢复高就立即释放
+    end
+end
+
+reg [15:0] lock_lost_cnt;
+reg        lock_ok_f;
+
+always @(posedge clk or negedge rst_n_f) begin
+    if (!rst_n_f) begin
+        lock_lost_cnt <= 16'd0;
+        lock_ok_f     <= 1'b0;
+    end else if (audio_pll_lock) begin
+        lock_lost_cnt <= 16'd0;
+        lock_ok_f     <= 1'b1;                  // 锁定 → 立即放行
+    end else if (lock_lost_cnt < 16'hFFFF) begin
+        lock_lost_cnt <= lock_lost_cnt + 16'd1;
+        if (lock_lost_cnt >= 16'd50_000)        // 持续 1ms 为低 → 判定真失锁
+            lock_ok_f <= 1'b0;
+    end
+end
+
 wire rst_all;
-assign rst_all = ~rst_n | ~audio_pll_lock;
+assign rst_all = ~rst_n_f | ~lock_ok_f;         // ★ 用消抖后的复位源
 
 // 保持你原来的 TF / SDRAM / video 时钟
 sys_pll sys_pll_m0(
@@ -269,7 +381,7 @@ cfg_cdc #(
 );
 
 //--------------------------------------------------------------------------
-// ★【新增】缩放百分比 → sd_card_clk(100MHz) 域
+// ★ 缩放百分比 → sd_card_clk(100MHz) 域
 //   给 sd_card_bmp 用：缩放值一变，它就重载当前图（见 sd_card_bmp.v）。
 //   和 u_cdc_period 完全一样的办法（多比特配置必须用 cfg_cdc，不能直接连线）。
 //--------------------------------------------------------------------------
@@ -337,7 +449,7 @@ cfg_cdc #(
 );
 
 //--------------------------------------------------------------------------
-// ★【新增】缩放百分比 → video_clk(25MHz) 域
+// ★ 缩放百分比 → video_clk(25MHz) 域
 //   给 OSD（左上角绿色参数界面）显示"缩放 100"用
 //--------------------------------------------------------------------------
 wire [7:0] cfg_zoom_pct_v;
@@ -434,8 +546,19 @@ wire [2:0]  img_found_count_sd;   // 共几张
 sd_card_bmp #(
     .CLK_FREQ_HZ       (100_000_000),
     .SCAN_START_SECTOR (32'd0),
-    .SCAN_MAX_SECTOR   (32'd131071),
-    .SCAN_TARGET_COUNT (3'd4)
+    // ★ 扫描范围：16MB（32768 个扇区）。原来是 131071（64MB），
+    //   逐扇区扫一遍要 22 秒以上，开机等太久（数码管最左位会长时间停在 2）。
+    //   图片通常放在根目录、位于卡的前部，16MB 足够覆盖几张广告图。
+    //   以后图片总容量变大，把这个值按需调大即可：
+    //     每 1MB ≈ 0.35 秒扫描时间（16MB ≈ 5.6 秒，32MB ≈ 11 秒）
+    .SCAN_MAX_SECTOR   (32'd32767),
+    // ★ 扫描目标张数：设成 7（3 位能表示的最大值）——
+    //   含义变成"找不到 7 张就把整张卡扫完再停"，
+    //   于是卡里放几张就显示几张：放 5 张显示 5 张、放 4 张显示 4 张，
+    //   不再被写死的数字限制。
+    //   扫描是"按簇跳 + 命中文件后整段跳过"的（见 bmp_read），
+    //   扫完 64MB 只需零点几秒，代价很小。
+    .SCAN_TARGET_COUNT (3'd7)
 ) sd_card_bmp_m0(
     .clk               (sd_card_clk),
     .rst               (rst_all),
@@ -465,7 +588,7 @@ sd_card_bmp #(
     .write_en          (sd_card_write_en),
     .write_data        (sd_card_write_data),
 
-    // ★【改造】SD 总线改为从顶层接入（图片和音频共用，由仲裁器分配）
+    // ★ SD 总线改为从顶层接入（图片和音频共用，由仲裁器分配）
     .sd_init_done           (sd_init_done_bus),
     .sd_sec_read            (bmp_sd_sec_read),
     .sd_sec_read_addr       (bmp_sd_sec_read_addr),
@@ -475,7 +598,7 @@ sd_card_bmp #(
 );
 
 // =========================================================================
-//  ★【新增】音频子系统：从 TF 卡读 WAV 音乐，经 HDMI 输出
+//  ★ 音频子系统：从 TF 卡读 WAV 音乐，经 HDMI 输出
 // -------------------------------------------------------------------------
 //  数据流：
 //
@@ -595,6 +718,12 @@ txt_read u_txt_read (
     .clk                    (sd_card_clk),
     .rst                    (rst_all),
     .scan_start             (txt_scan_start),
+    // ★ 扫描范围：改回 64MB（2026-10-06 当天改过一次又改回来了）
+    //   曾缩到 16MB 想加快扫描，结果 bgm48k.wav（23.8MB）的文件头
+    //   根本不在前 16MB 内 → 固件找不到音乐文件 → 直接没声音。
+    //   教训：扫描范围必须覆盖"文件头可能出现的最远位置"，
+    //        而大文件（比如 24MB 的 WAV）的头就可能落在很后面。
+    //        不能为了提速就砍范围。
     .scan_max_sector        (32'd131071),
     .scan_done              (txt_scan_done),
     .scan_found             (txt_scan_found),
@@ -625,6 +754,12 @@ wav_read #(
     .clk                    (sd_card_clk),
     .rst                    (rst_all),
     .scan_start             (wav_scan_start),
+    // ★ 扫描范围：改回 64MB（2026-10-06 当天改过一次又改回来了）
+    //   曾缩到 16MB 想加快扫描，结果 bgm48k.wav（23.8MB）的文件头
+    //   根本不在前 16MB 内 → 固件找不到音乐文件 → 直接没声音。
+    //   教训：扫描范围必须覆盖"文件头可能出现的最远位置"，
+    //        而大文件（比如 24MB 的 WAV）的头就可能落在很后面。
+    //        不能为了提速就砍范围。
     .scan_max_sector        (32'd131071),
     .scan_done              (wav_scan_done),
     .scan_found             (wav_scan_found),
@@ -705,11 +840,10 @@ wire [23:0] aud_right;
 wire [15:0] aud_underrun;
 wire [15:0] aud_frame_cnt;
 
-// ★【新增】转场模块的线网，必须在"第一次被用到之前"先声明，
+// ★ 转场模块的线网，必须在"第一次被用到之前"先声明，
 //   否则会被综合器当成隐式线网、截断成 1 位 → HDL-7225 警告 + 功能异常。
 //   实际例化位置在下面 osd_adjust 之前，但这里 audio_player 就要用 fade_gain。
-wire [7:0]  fade_gain;      // 转场时的背景音乐音量（128~255）
-wire [1:0]  fade_state;     // 转场状态（调试用）
+wire [7:0]  fade_gain;      // 转场时的背景音乐音量（128~255）—— 预留接口，当前未接进 audio_player
 wire [23:0] vout_fade;      // 转场处理后的像素
 wire        hs_fade, vs_fade, de_fade;
 
@@ -725,7 +859,7 @@ audio_player #(
     .O_audio_valid      (aud_valid),
     .O_audio_left_data  (aud_left),
     .O_audio_right_data (aud_right),
-    // ★【按用户要求】音量恒定，转场只影响画面，绝不碰音频。
+    // ★ 音量恒定，转场只影响画面，绝不碰音频。
     //   fade_ctrl 仍然输出 O_gain（音视频联动量），但这里故意不接 ——
     //   如果以后想拿"音视频联动"这个加分项，把下面改成 (fade_gain) 即可。
     .I_gain             (8'd255),           // 255 = 原音量，不衰减
@@ -799,7 +933,7 @@ seg_display u_seg_display (
 
 seg_scan seg_scan_m0(
     .clk               (clk),
-    .rst_n             (rst_n),
+    .rst_n             (rst_n_f),      // ★ 用消抖后的复位，与全系统保持一致
     .seg_sel           (seg_sel),
     .seg_data          (seg_data),
     .seg_data_0        (seg_d0),
@@ -889,7 +1023,7 @@ image_processor u_image_processor (
 // =========================================================================
 
 // =========================================================================
-//  ★【新增】换图转场（第 2 级）：栅格化淡出 → 全黑 → 栅格化淡入  【加分项②】
+//  ★ 换图转场（第 2 级）：栅格化淡出 → 全黑 → 栅格化淡入  【加分项②】
 // -------------------------------------------------------------------------
 //  数据流：vout_proc → [fade_ctrl] → vout_fade → [osd_adjust] → ...
 //
@@ -935,9 +1069,8 @@ fade_ctrl u_fade_ctrl (
     .I_en        (1'b1),
     .I_load_busy (load_busy_s2),
     .I_period_sec(cfg_period_sec_v),   // ★ 转场时长 = 轮播周期的 1/10
-    .I_frame_new (1'b0),
-    .O_gain      (fade_gain),
-    .O_state     (fade_state)
+    .O_gain      (fade_gain),      // 预留：音视频联动（当前未接进 audio_player）
+    .O_state     ()                // 调试状态，未使用
 );
 
 wire [23:0] vout_osd;
@@ -1153,8 +1286,8 @@ hdmi_1_4b_transmitter_core_wrapper #(
     .I_pixel_clk        (video_clk),
     .I_rst              (rst_all),
     .I_edid_read_trig   (edid_trig),
-    .O_edid_read_valid  (edid_valid),
-    .O_edid_read_data   (edid_data),
+    .O_edid_read_valid  (),        // EDID 读取结果当前不使用（DDC 由核内部处理）
+    .O_edid_read_data   (),
 
     .I_axis_s_user      (axis_s_user),
     .I_axis_s_valid     (axis_s_valid),
@@ -1162,7 +1295,7 @@ hdmi_1_4b_transmitter_core_wrapper #(
     .I_axis_s_data      (axis_s_data),
     .O_axis_s_ready     (axis_s_ready),
 
-    // ★【改造】音频数据来自 TF 卡（audio_player），不再是内部测试音
+    // ★ 音频数据来自 TF 卡（audio_player），不再是内部测试音
     .I_audio_valid      (aud_valid),
     .I_audio_left_data  (aud_left_out),     // ★ 经过 SW3 音乐开关
     .I_audio_right_data (aud_right_out),    // ★ 经过 SW3 音乐开关

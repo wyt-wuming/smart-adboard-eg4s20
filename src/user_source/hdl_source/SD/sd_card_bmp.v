@@ -1,21 +1,29 @@
 
 //==============================================================================
-//  文件名  : sd_card_bmp.v   （改造版）
-//  功能    : TF 卡 BMP 图片扫描 / 装载 / 轮播调度 / 双缓冲切换
+//  文件名  : sd_card_bmp.v
+//  模块名  : sd_card_bmp
+//  功能    : TF 卡 BMP 图片通道 —— 扫描 / 装载 / 轮播调度 / 双缓冲切换
+//  时钟域  : sd_card_clk（100MHz）
+//  上游    : sd_card_top（扇区数据，经 sd_bus_arbiter 仲裁后接入）
+//  下游    : frame_fifo_write → SDRAM 帧缓存
 //------------------------------------------------------------------------------
-//  【本次改造（赛题一）新增/修改的内容，用 ★ 标出】
-//    ★1. 新增 I_period_sec 端口：轮播周期由外部按键状态机给出（赛题要求"周期可配置"）
-//        原来写死 1 秒（assign auto_tick = (auto_cnt == CLK_FREQ_HZ - 1)），
-//        现在改成"1 秒节拍 + 秒计数器"，与 I_period_sec 比较。
-//        这样做同时避免了一个坑：若继续用"周期×100MHz"直接比较，
-//        30 秒 × 100MHz = 3.0e9 会超出 32 位有符号整数范围（2.147e9）导致溢出。
-//    ★2. 删除了内部两个 key_press_debounce 例化：
-//        外层 key_ctrl_fsm 已经完成了消抖，送进来的是"单拍脉冲"。
-//        若在这里再消抖一次，20ns 宽的脉冲会被漏掉 → 按键完全失效！
-//    ★3. 新增若干"状态输出"端口（O_load_busy / O_auto_play_en /
-//        O_img_idx / O_img_found_count），供 OSD 叠加和转场控制使用。
+//  【模块职责】
+//    1. 开机扫描 TF 卡，找到所有 BMP 图（最多 8 张，记录各自扇区号）
+//    2. 按轮播周期（I_period_sec = 5~30 秒）自动换图；按键可手动切图
+//    3. 装载流程：bmp_read 读原始像素 → img_scaler 等比缩放 → 写帧缓存
+//    4. 双缓冲调度（write_buf_idx / disp_buf_idx），装载期间画面不闪不撕
+//    5. 缩放值（I_zoom_pct）变化时自动重载当前图，带 400ms 节流
+//
+//  【三个必须保留的设计细节（改动会出 bug）】
+//    ★1. 轮播周期用"1 秒节拍 + 秒计数器"实现，不能写成"周期 × 100MHz"
+//        直接比较：30 秒 × 100MHz = 3.0e9 超出 32 位有符号整数范围（2.147e9）
+//        → 溢出失效。
+//    ★2. 按键输入 key_next 是外层 key_ctrl_fsm 消抖后的**单拍脉冲**，
+//        本模块内部不能再消抖（再消抖一次会把 20ns 宽的脉冲漏掉 → 按键失效）。
+//    ★3. 状态输出（O_load_busy / O_auto_play_en / O_img_idx / O_img_found_count）
+//        供转场 fade_ctrl 和 OSD 显示使用，改动时序时要一起检查。
 //------------------------------------------------------------------------------
-//  所属工程: 基于安路 EG4S20 的智能数字广告牌系统
+//  所属工程: 基于安路 EG4S20 的智能数字广告牌系统（赛题一 · 2026）
 //==============================================================================
 module sd_card_bmp #(
     parameter integer CLK_FREQ_HZ       = 100_000_000,
@@ -26,9 +34,9 @@ module sd_card_bmp #(
     input                       clk,              // sd_card_clk = 100MHz
     input                       rst,              // 高有效复位
     input                       key_next,         // ★ 手动切下一张（单拍脉冲，勿再消抖）
-    input                       auto_play_ext,    // ★【改】自动轮播开关（电平），来自拨码开关 SW2
-    input  [7:0]                I_period_sec,     // ★【新增】轮播周期（秒），来自 key_ctrl_fsm
-    // ★【新增】画面缩放百分比（50~200，100=原图大小），由 key_ctrl_fsm 经 cfg_cdc 送过来。
+    input                       auto_play_ext,    // ★ 自动轮播开关（电平），来自拨码开关 SW2
+    input  [7:0]                I_period_sec,     // ★ 轮播周期（秒），来自 key_ctrl_fsm
+    // ★ 画面缩放百分比（50~200，100=原图大小），由 key_ctrl_fsm 经 cfg_cdc 送过来。
     //   它一变就要"重新装载当前这张图"（因为缩放只能在装载时对像素流做），
     //   见下面的"缩放值变化 → 重载"逻辑。
     input  [7:0]                I_zoom_pct,
@@ -37,7 +45,7 @@ module sd_card_bmp #(
     input  [15:0]               bmp_height,
     output reg                  display_valid,    // 是否已有可显示的画面
 
-    // ---- ★【新增】给 OSD / 转场模块用的状态输出 ----
+    // ---- ★ 给 OSD / 转场模块用的状态输出 ----
     output                      O_load_busy,      // 正在装载新图（转场淡出用）
     output                      O_auto_play_en,   // 自动轮播是否开启（OSD 显示用）
     output [2:0]                O_img_idx,        // 当前显示第几张（OSD 显示用）★ 2→3 位
@@ -52,7 +60,7 @@ module sd_card_bmp #(
     output                      write_en,
     output [31:0]               write_data,
 
-    // ---- ★【改造】SD 卡总线改为从外部接入（sd_card_top 提到顶层）----
+    // ---- ★ SD 卡总线改为从外部接入（sd_card_top 提到顶层）----
     //   原因：图片读取和音频读取要共用同一条 SPI 总线，
     //         所以 sd_card_top 必须在顶层只例化一份，由 sd_bus_arbiter 分配使用权。
     //   本模块从此不再直接驱动 SD 引脚。
@@ -66,8 +74,8 @@ module sd_card_bmp #(
 
 wire key_next_press;
 
-// ★【改造】sd_sec_read* / sd_init_done 已提升为模块端口，此处不再声明
-// ★【自适应缩放改造】这三条线是 bmp_read 的**原始**输出（未缩放），
+// ★ sd_sec_read* / sd_init_done 已提升为模块端口，此处不再声明
+// ★ 这三条线是 bmp_read 的**原始**输出（未缩放），
 //   先送进 img_scaler 做等比缩放，缩放后的结果才接到 write_en/write_data。
 wire             src_bmp_wr;        // 源图像素有效
 wire [23:0]      src_bmp_data;      // 源图像素颜色
@@ -88,17 +96,17 @@ reg              load_start_pulse;
 reg [31:0]       load_sector;
 reg              scan_kicked;
 reg              first_image_committed;
-// ★【改造】自动轮播开关改成"外部电平"：由拨码开关 SW2 直接控制，
+// ★ 自动轮播开关改成"外部电平"：由拨码开关 SW2 直接控制，
 //   不再是内部按键翻转，所以用 wire 而不是 reg
 wire             auto_play_en = auto_play_ext;
-// ★【改造】轮播周期计数：改成"1 秒节拍 + 秒计数器"
+// ★ 轮播周期计数：改成"1 秒节拍 + 秒计数器"
 //   原实现是 reg [31:0] auto_cnt + 与 CLK_FREQ_HZ-1 比较（写死 1 秒）。
 //   改成秒计数器后：① 周期可通过 I_period_sec 配置 ② 最长 30 秒也不会溢出
 reg [26:0]       sec_div_cnt;      // 1 秒分频计数器（100MHz 时钟下数到 99_999_999）
 reg              tick_1sec;        // 1 秒单拍脉冲
 reg [15:0]       auto_sec_cnt;     // 自动轮播已累计的秒数
 reg [2:0]        img_found_count;
-// ★【改造】图片编号从 2 位加宽到 3 位（原来只能数到 3，只能放 4 张图）
+// ★ 图片编号从 2 位加宽到 3 位（原来只能数到 3，只能放 4 张图）
 reg [2:0]        img_idx;              // 当前真正显示中的图片编号 0~6
 reg [2:0]        load_idx;             // 当前正在写入的图片编号 0~6
 reg [1:0]        pending_buf_idx;      // 当前正在写入的目标缓冲区
@@ -106,17 +114,40 @@ reg [31:0]       img_sector0;
 reg [31:0]       img_sector1;
 reg [31:0]       img_sector2;
 reg [31:0]       img_sector3;
-// ★【新增】第 5~8 个槽位（原来只有 4 个，卡上多的图轮不到）
+// ★ 第 5~8 个槽位（原来只有 4 个，卡上多的图轮不到）
 reg [31:0]       img_sector4;
 reg [31:0]       img_sector5;
 reg [31:0]       img_sector6;
 reg [31:0]       img_sector7;
 reg              next_req_pending;
+
+// ★ 装载超时兜底（2026-10-06 加，阈值当天修正过）
+//   用途：万一装载因为异常永远不完成（卡读失败 / 帧缓存写不满…），
+//        强制释放 load_busy，避免整个系统永久卡在"装载中"。
+//
+//   ★★ 阈值必须足够大，否则会"自己打断自己"：
+//      一张 640x480 的 BMP = 921654 字节 = 1800 个扇区，
+//      SD 卡单块读的响应延迟约 1~2ms/扇区 → 整张图要 3.6 秒左右。
+//      （曾经设成 2.7 秒：装载读到一半就被超时打断 → load_busy 被清 →
+//        系统重新发起装载 → 又被打断，无限循环，
+//        表现是数码管最左位一直停在 4、画面永远全黑。）
+//   现在给到 30 秒，正常装载 3.6 秒只用掉零头，纯粹当保险。
+localparam [31:0] LOAD_TIMEOUT_MAX = 32'd3_000_000_000;   // 30 秒 @100MHz
+reg [31:0]       load_timeout;
 reg              load_busy;
 
-// ★【新增】画面缩放：缩放值一变就重载当前图（带 400ms 节流，防按键连发时疯狂重载）
+// ★ 画面缩放：缩放值一变就重载当前图（带 400ms 节流，防按键连发时疯狂重载）
 //   100MHz 下 400ms = 40_000_000 拍，27 位计数器够（最大 1.34 亿）
 localparam [26:0] RELOAD_GAP = 27'd40_000_000;   // 两次重载之间至少隔 400ms
+
+// ★ "静默重载"（2026-10-06 加）
+//   每重载一次都要把源图从 SD 卡重读一遍（约 3.6 秒），
+//   如果"每按一下就重载一次"，从 100% 调到 50% 要按 10 次 → 等 36 秒，没法用。
+//   改成：连按期间只更新数值、并不断重置这个静默计时器；
+//        松手（数值 500ms 不变）之后才真正重载一次。
+//   同样的操作从 36 秒降到约 4 秒。
+localparam [26:0] ZOOM_QUIET_GAP = 27'd50_000_000;   // 500ms 静默 @100MHz
+reg [26:0]       zoom_quiet;      // 距上次缩放值变化过了多久
 reg [7:0]        zoom_d;          // 上一拍的缩放值（用来检测变化）
 reg              zoom_pending;    // 1 = 缩放值变过、还没重载
 reg              reload_ok;       // 1 = 允许重载（节流门闩）
@@ -130,13 +161,17 @@ reg [2:0]        wrfin_tgl_sync;
 wire             write_finish_pulse;
 
 wire auto_tick;
-wire [1:0] next_from_current;
+// ★ 位宽必须是 3 位（0~7）：原来写成 2 位，而 next_index_limited() 返回 3 位，
+//   最高位被截断 —— 图片超过 4 张时，"下一张"算出来的索引 4/5/6/7 会被截成
+//   0/1/2/3，表现就是第 5 张之后切图错乱（切回第 1 张）。
+//   这是当初"4 张扩到 8 张"时漏改的一处。
+wire [2:0] next_from_current;
 
-// ★【自适应缩放改造】写入帧缓存的像素改为"缩放后"的数据
+// ★ 写入帧缓存的像素改为"缩放后"的数据
 assign write_en   = scaled_wr;
 assign write_data = {scaled_data[23:16], scaled_data[15:8], scaled_data[7:0], 8'b0};
 //--------------------------------------------------------------------------
-// ★【改造】自动轮播计时：1 秒节拍 + 秒计数
+// ★ 自动轮播计时：1 秒节拍 + 秒计数
 //   原来：assign auto_tick = (auto_cnt == (CLK_FREQ_HZ - 1));   // 写死 1 秒
 //   现在：先产生 1 秒节拍，再与外部传入的 I_period_sec 比较
 //   好处：① 满足赛题"轮播周期可配置" ② 30 秒也不会溢出 32 位整数
@@ -162,7 +197,7 @@ assign next_from_current = next_index_limited(img_idx, img_found_count);
 assign write_finish_pulse = wrfin_tgl_sync[2] ^ wrfin_tgl_sync[1];
 
 //--------------------------------------------------------------------------
-// ★【改造】原例程在这里例化两个 key_press_debounce 做按键消抖。
+// ★ 原例程在这里例化两个 key_press_debounce 做按键消抖。
 //   现在按键消抖与长短按/双击解析已由外层的 key_ctrl_fsm + key_press_event
 //   完成，送进来的是"单拍脉冲"（宽度 1 个时钟周期），必须直接使用。
 //
@@ -172,7 +207,7 @@ assign write_finish_pulse = wrfin_tgl_sync[2] ^ wrfin_tgl_sync[1];
 //     这是本次改造中最隐蔽、最容易踩的坑，务必保留此注释。
 //--------------------------------------------------------------------------
 //--------------------------------------------------------------------------
-// ★【修复】按键脉冲跨时钟域同步
+// ★ 按键脉冲跨时钟域同步
 //   key_next 是从 50MHz 的 clk 域送过来的"单拍脉冲"（宽 20ns），
 //   而本模块工作在 100MHz 的 sd_card_clk 域。
 //   直接采样属于跨时钟域，偶尔会因亚稳态漏掉脉冲 ——
@@ -198,7 +233,7 @@ end
 
 assign key_next_press = key_next_s1 & ~key_next_s2;   // 上升沿 → 干净的单拍脉冲
 
-// ★【改造】原来只支持 4 张图（写死 4 个 case），现在改成"按实际找到的张数
+// ★ 原来只支持 4 张图（写死 4 个 case），现在改成"按实际找到的张数
 //   自动环绕"，最大 8 张。这样卡上放几张就轮几张，加图减图都不用改代码。
 function [2:0] next_index_limited;
     input [2:0] cur;
@@ -270,6 +305,7 @@ always @(posedge clk or posedge rst) begin
         display_valid         <= 1'b0;
         zoom_d                <= 8'd100;
         zoom_pending          <= 1'b0;
+        zoom_quiet            <= 27'd0;
         reload_ok             <= 1'b1;
         reload_cnt            <= 27'd0;
     end else begin
@@ -278,7 +314,7 @@ always @(posedge clk or posedge rst) begin
         load_start_pulse <= 1'b0;
 
         //------------------------------------------------------------------
-        // ★【新增】缩放值变化检测 + 400ms 节流
+        // ★ 缩放值变化检测 + 400ms 节流
         //   缩放只能在"装载"时对像素流做（显示端是顺序流式读 SDRAM，
         //   没法随机访问），所以缩放值一变就必须重载当前这张图。
         //   而按键长按每 150ms 就连发一次，若不节流会疯狂重载
@@ -288,8 +324,13 @@ always @(posedge clk or posedge rst) begin
         //                 真正发起重载时才清零 → 松手后画面一定是新比例。
         //   reload_ok   ：节流门闩，发起重载时清零，400ms 后自动置 1。
         //------------------------------------------------------------------
-        if (I_zoom_pct != zoom_d)
+        // ★ 缩放值检测 + 静默计时（连按时不断重置，停手 500ms 后才允许重载）
+        if (I_zoom_pct != zoom_d) begin
             zoom_pending <= 1'b1;
+            zoom_quiet   <= 27'd0;               // 数值刚变 → 静默计时清零
+        end else if (zoom_quiet < ZOOM_QUIET_GAP) begin
+            zoom_quiet <= zoom_quiet + 27'd1;    // 数值稳定了 → 开始累计静默时间
+        end
         zoom_d <= I_zoom_pct;
 
         if (reload_ok)
@@ -339,6 +380,14 @@ always @(posedge clk or posedge rst) begin
                     img_found_count <= img_found_count + 3'd1;
             end
 
+            // 装载计时：load_busy 期间逐拍递增，空闲时清零
+            // ★ 位宽必须是 32 位：若写成 28'd1，加法会在 28 位里回绕
+            //   （28 位最大 2.68 亿 = 2.7 秒），计数器永远到不了 30 亿这个阈值。
+            if (!load_busy)
+                load_timeout <= 32'd0;
+            else if (load_timeout < LOAD_TIMEOUT_MAX)
+                load_timeout <= load_timeout + 32'd1;
+
             // 记住 bmp_read 已经把源图送完 FIFO，但还不能切显示，得等整帧写完
             if (load_busy && bmp_ready)
                 source_done_seen <= 1'b1;
@@ -351,8 +400,15 @@ always @(posedge clk or posedge rst) begin
                 img_idx               <= load_idx;
                 display_valid         <= 1'b1;
                 first_image_committed <= 1'b1;
-                // ★【改】自动轮播现在完全由拨码开关 SW2 控制（外部电平），
+                // ★ 自动轮播现在完全由拨码开关 SW2 控制（外部电平），
                 //   所以这里不再自动开启，也不需要按键翻转逻辑。
+            end
+            // ★ 装载超时兜底：万一装载因为某种原因永远不完成
+            //   （卡读失败、帧缓存没写满、SD 通信中断…），
+            //   强制释放 load_busy，让系统能继续响应按键，而不是永久黑屏卡死。
+            else if (load_busy && (load_timeout >= LOAD_TIMEOUT_MAX)) begin
+                load_busy        <= 1'b0;
+                source_done_seen <= 1'b0;
             end
 
             // 上电后自动发起一次“扫描前 4 张 BMP”
@@ -376,7 +432,7 @@ always @(posedge clk or posedge rst) begin
                 if (key_next_press && scan_done && (img_found_count > 3'd0))
                     next_req_pending <= 1'b1;
 
-                // ★【改】自动轮播开关现在由拨码开关 SW2 直接控制（电平信号），
+                // ★ 自动轮播开关现在由拨码开关 SW2 直接控制（电平信号），
                 //   不再需要"按键翻转"逻辑。
                 //   注意：下面自动计时条件里包含 auto_play_en，
                 //   所以拨到 OFF 时 auto_sec_cnt 会被清零；
@@ -430,12 +486,14 @@ always @(posedge clk or posedge rst) begin
                     auto_sec_cnt     <= 16'd0;
                     zoom_pending     <= 1'b0;   // ★ 这次装载已经用了最新缩放值
                 end
-                // ★【新增】缩放值变化 → 重载"当前这一张"
+                // ★ 缩放值变化 → 重载"当前这一张"
                 //   写在"非当前显示"的另一块 buffer 里，显示画面完全不受影响，
                 //   装载完成后由 write_finish_toggle 那一拍统一切换。
                 //   优先级放在自动播放之下：正在换图/轮播时不插队，等空下来再重载。
                 else if (scan_done && bmp_ready && display_valid && !load_busy
-                         && zoom_pending && reload_ok && (img_found_count != 3'd0)) begin
+                         && zoom_pending && reload_ok
+                         && (zoom_quiet >= ZOOM_QUIET_GAP)           // ★ 等用户停手 500ms
+                         && (img_found_count != 3'd0)) begin
                     load_idx         <= img_idx;                  // ★ 还是当前这张
                     load_sector      <= sector_lut(img_idx);
                     pending_buf_idx  <= next_buf_lut(disp_buf_idx, display_valid);
@@ -490,7 +548,7 @@ bmp_read bmp_read_m0(
 );
 
 //==========================================================================
-//  ★【新增】自适应缩放器（加分项③）
+//  ★ 自适应缩放器（加分项③）
 //    任意尺寸的源图 → 等比缩放到 480 高 → 写进 640x480 帧缓存
 //    比 640 窄的居中补黑，比 640 宽的居中裁掉
 //==========================================================================
@@ -509,7 +567,7 @@ img_scaler u_img_scaler (
 );
 
 //==========================================================================
-//  ★【改造】原例程在这里例化 sd_card_top（SD 卡控制器）。
+//  ★ 原例程在这里例化 sd_card_top（SD 卡控制器）。
 //    现在它被提到顶层，因为图片读取（本模块）和音频读取（wav_read）
 //    需要共用同一条 SPI 总线，由 sd_bus_arbiter 做扇区级仲裁。
 //
@@ -519,7 +577,7 @@ img_scaler u_img_scaler (
 //==========================================================================
 
 //==========================================================================
-//  ★【新增】内部状态引出
+//  ★ 内部状态引出
 //    这些信号原本只在模块内部使用，现在引出来给上层用：
 //      O_load_busy       → fade_ctrl（转场模块）据此提前开始淡出
 //      O_auto_play_en    → OSD 叠加显示自动轮播状态
@@ -530,51 +588,5 @@ assign O_load_busy       = load_busy;
 assign O_auto_play_en    = auto_play_en;
 assign O_img_idx         = img_idx;
 assign O_img_found_count = img_found_count;
-
-endmodule
-
-module key_press_debounce #(
-    parameter integer CLK_FREQ_HZ = 100_000_000,
-    parameter integer DEBOUNCE_MS = 20
-)(
-    input  wire clk,
-    input  wire rst,
-    input  wire button_in,    // 默认：松开=1，按下=0
-    output reg  press_pulse
-);
-
-localparam integer DEBOUNCE_CYCLES = (CLK_FREQ_HZ / 1000) * DEBOUNCE_MS;
-
-reg button_sync0;
-reg button_sync1;
-reg button_stable;
-reg [31:0] cnt;
-
-always @(posedge clk or posedge rst) begin
-    if (rst) begin
-        button_sync0  <= 1'b1;
-        button_sync1  <= 1'b1;
-        button_stable <= 1'b1;
-        cnt           <= 32'd0;
-        press_pulse   <= 1'b0;
-    end else begin
-        button_sync0 <= button_in;
-        button_sync1 <= button_sync0;
-        press_pulse  <= 1'b0;
-
-        if (button_sync1 == button_stable) begin
-            cnt <= 32'd0;
-        end else begin
-            if (cnt >= DEBOUNCE_CYCLES - 1) begin
-                if (button_stable && !button_sync1)
-                    press_pulse <= 1'b1;
-                button_stable <= button_sync1;
-                cnt           <= 32'd0;
-            end else begin
-                cnt <= cnt + 32'd1;
-            end
-        end
-    end
-end
 
 endmodule

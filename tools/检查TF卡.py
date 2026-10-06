@@ -96,7 +96,11 @@ else:
             continue
 
         # 解码正文
+        # ★ 先跳过标记后面的换行/空白：用的是记事本的话通常会敲一个回车，
+        #   不跳过的话会被当成"正文到换行就结束" → 显示正文为空
         body = data[6:]
+        while body[:1] in (b'\r', b'\n', b' ', b'\t'):
+            body = body[1:]
         end = len(body)
         for i, b in enumerate(body):
             if b in (0, 10, 13):
@@ -137,22 +141,52 @@ else:
 
 # ---- 4. 检查图片 ----
 print()
-print('【第 3 步】广告图片检查')
+print('【第 3 步】广告图片检查  ★ 重点看"行填充"')
 print('-' * 62)
 bmp = [n for n, _ in files if n.upper().endswith('.BMP')]
-print('  找到 %d 个 .bmp 文件' % len(bmp))
+print('  找到 %d 个 .bmp 文件（自适应缩放支持任意尺寸，但要满足下面的条件）' % len(bmp))
+bad_pad = []
 for name in bmp[:8]:
     p = os.path.join(root, name)
     h = open(p, 'rb').read(54)
-    tag = h[:2]
-    if tag != b'BM':
-        print('    %-30s ❌ 开头不是 "BM"（其实是别的格式改了后缀？）' % name)
+    if h[:2] != b'BM':
+        print('    %-26s ❌ 开头不是 "BM"（其实是别的格式改了后缀？）' % name)
         continue
-    w, ht = struct.unpack('<ii', h[18:26])
-    bpp = struct.unpack('<H', h[28:30])[0]
-    ok = (w == 640 and abs(ht) == 480 and bpp == 24)
-    print('    %-30s %dx%d %dbit  %s' % (name, w, abs(ht), bpp,
-          '✅' if ok else '⚠ 工程只支持 640x480 24bit'))
+    w, ht  = struct.unpack('<ii', h[18:26])
+    bpp    = struct.unpack('<H', h[28:30])[0]
+    comp   = struct.unpack('<I', h[30:34])[0]
+    off    = struct.unpack('<I', h[10:14])[0]
+    W, H   = abs(w), abs(ht)
+    # ★ BMP 规定：每行的字节数必须是 4 的倍数，不足要在行尾补 0（行填充）
+    #   本工程的 bmp_read 按"每 3 字节一个像素"连续读，不跳过行填充，
+    #   所以宽度不是 4 的倍数时，每行会错位 → 画面花屏！
+    row_raw = W * 3
+    pad     = ((row_raw + 3) // 4) * 4 - row_raw
+    msgs = []
+    if bpp != 24:
+        msgs.append('位深 %d bit（必须 24）' % bpp)
+    if comp != 0:
+        msgs.append('有压缩（必须是 0 = 不压缩）')
+    if W > 2048 or H > 2048:
+        msgs.append('尺寸超 2048 上限')
+    if pad:
+        msgs.append('★ 行填充 %d 字节 → 会花屏！' % pad)
+        bad_pad.append((name, W, H, pad))
+    status = '✅ 合格' if not msgs else '❌ ' + '；'.join(msgs)
+    print('    %-26s %4dx%-4d %2dbit 压缩=%d 头长=%d  %s'
+          % (name, W, H, bpp, comp, off, status))
+
+if bad_pad:
+    print()
+    print('  ★★★ 这几张图会导致花屏（宽度不是 4 的倍数）★★★')
+    for name, W, H, pad in bad_pad:
+        print('      %s   %dx%d   每行多出 %d 个填充字节' % (name, W, H, pad))
+    print()
+    print('  原因：BMP 格式规定每行字节数必须是 4 的倍数，宽度不是 4 的倍数时')
+    print('        行尾要补 0 字节；本工程的 bmp_read 按"每 3 字节一个像素"')
+    print('        连续读取，不会跳过这些填充 → 每行错位几个像素 → 累积花屏。')
+    print('  解决：用 tools/convert/convert_images_to_bmp.py 重新转成宽度 4 的倍数')
+    print('        （推荐直接用默认的 640x480，或 636 / 800 / 1024 等）')
 
 # ---- 5. 检查音乐 ----
 print()

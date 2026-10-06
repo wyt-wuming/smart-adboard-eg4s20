@@ -1,4 +1,14 @@
 
+//==============================================================================
+//  文件名  : sd_card_sec_read_write.v
+//  模块名  : sd_card_sec_read_write
+//  功能    : 扇区读写状态机（CMD17 单块读 / CMD24 单块写）
+//  时钟域  : sd_card_clk（100MHz）
+//  说明    : 参考例程模块
+//------------------------------------------------------------------------------
+//  所属工程: 基于安路 EG4S20 的智能数字广告牌系统（赛题一 · 2026）
+//==============================================================================
+
 module sd_card_sec_read_write
 #(
 	parameter  SPI_LOW_SPEED_DIV = 248,         // spi clk speed = clk speed /((SPI_LOW_SPEED_DIV + 2) * 2 )
@@ -35,8 +45,6 @@ module sd_card_sec_read_write
 	input            block_write_data_rd,
 	input            block_write_req_ack
 );
-reg[7:0] read_data;
-reg[31:0] timer;
 
 localparam S_IDLE               = 0;
 localparam S_CMD0               = 1;
@@ -55,6 +63,15 @@ localparam S_CMD16              = 18;
 
 reg[4:0]                       state;
 reg[31:0]                      sec_addr;
+
+// ★ 上电等待计数器（2026-10-06 加）
+//   SD 卡规范要求：上电稳定至少 1ms 之后才能收第一条命令，且要给它 74 个以上时钟。
+//   原来复位一放开就立刻发 CMD0，遇到"卡还处在上次通信中断的中间态"时，
+//   卡会一直不应答 → 初始化永远完不成 → 数码管位5 恒为 0、图片/音乐/字幕全没有。
+//   这种状态靠按键复位救不回来（卡本身没有重新上电），必须断电才行。
+//   这里先等约 100ms 再开始初始化，让卡有时间稳定下来。
+localparam [27:0] PWR_WAIT_MAX = 28'd10_000_000;      // 100ms @100MHz
+reg [27:0]                    pwr_wait;
 assign sd_sec_read_data_valid = (state == S_READ) && block_read_valid;
 assign sd_sec_read_data = block_read_data;
 assign sd_sec_read_end = (state == S_READ_END);
@@ -76,14 +93,19 @@ begin
 		block_read_req <= 1'b0;
 		sec_addr <= 32'd0;
 		sd_init_done <= 1'b0;
+		pwr_wait <= 28'd0;
 	end
 	else
 		case(state)
 			S_IDLE:
 			begin
-				state <= S_CMD0;
 				sd_init_done <= 1'b0;
 				spi_clk_div <= SPI_LOW_SPEED_DIV[15:0];
+				// ★ 先等约 100ms 让 SD 卡上电稳定，再开始初始化
+				if (pwr_wait < PWR_WAIT_MAX)
+					pwr_wait <= pwr_wait + 28'd1;
+				else
+					state <= S_CMD0;
 			end
 			S_CMD0:
 			begin

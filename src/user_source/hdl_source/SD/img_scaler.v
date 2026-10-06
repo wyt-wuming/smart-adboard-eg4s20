@@ -2,6 +2,7 @@
 //  文件名  : img_scaler.v
 //  模块名  : img_scaler
 //  功能    : 任意尺寸 BMP → 640x480 自适应等比缩放（高度填满，左右补黑/裁切）
+//  时钟域  : sd_card_clk（100MHz）
 //------------------------------------------------------------------------------
 //  【对应赛题】加分项③"图片自适应缩放"
 //
@@ -101,6 +102,21 @@ module img_scaler (
     localparam [15:0] DST_W = 16'd640;
     localparam [15:0] DST_H = 16'd480;
 
+    //==========================================================================
+    //  ★ 输出分频（2026-10-06 新增）
+    //    本模块在 S_EMIT 状态是"1 拍吐 1 个像素"的突发式输出，
+    //    连续 640 拍就能吐完整整一行；而下游的写 FIFO（wfifo_32_32_512）
+    //    深度只有 512 —— 640 > 512，**FIFO 会被写爆，像素直接丢**，
+    //    表现为画面横条纹 + 写不满一帧导致永远不切换。
+    //    原来的设计没问题，是因为 bmp_read 的输出速率只有约 106 拍/像素
+    //    （SPI 读卡慢），FIFO 有的是时间排空；插入缩放器后输出变成了突发。
+    //    这里把输出降速到每 EMIT_DIV+1 拍一个像素：
+    //      25 MHz @100MHz 时钟 → 远低于 SDRAM 写入能力，FIFO 再也不会满；
+    //      而输出一整帧只要 307200 x 4 = 123 万拍 ≈ 12 ms，
+    //      相比源数据到达需要的 ~326 ms 仍然快得多，不影响装载速度。
+    //==========================================================================
+    localparam [1:0] EMIT_DIV = 2'd3;      // 3 = 每 4 拍输出一个像素
+
     localparam [2:0] S_IDLE = 3'd0;   // 等新图
     localparam [2:0] S_WD   = 3'd1;   // 算缩放后宽度 W_dst
     localparam [2:0] S_SKIP = 3'd2;   // 算裁切时要跳过的源列（含 DDA 初值）
@@ -129,7 +145,7 @@ module img_scaler (
     reg [31:0] ha0;        // 横向 DDA 起始累加值
     reg [31:0] ca0;        // 横向 DDA 起始比较值
 
-    // ---- ★【新增】画面缩放相关 ----
+    // ---- ★ 画面缩放相关 ----
     //   H_dst = 480 x zoom / 100   —— 缩放后图像的高度
     //   top_pad / img_bot  —— 上下黑边的边界
     //   w_acc_init —— 纵向 DDA 的初值（放大时头部要跳过的源行）
@@ -155,6 +171,7 @@ module img_scaler (
     reg [31:0] h_acc;      // 横向：(dx-pad_left) x 源高
     reg [31:0] c_acc;      // 横向：(sx+1) x 480
     reg [15:0] sx;         // 横向当前源列
+    reg [1:0]  emit_div;   // ★ 输出分频计数器（0 = 本拍可以吐像素）
 
     // 定点换算的临时量（重复减法，只在换图时用一次）
     reg [31:0] tmp_num;
@@ -248,6 +265,7 @@ module img_scaler (
             h_acc   <= 32'd0;
             c_acc   <= 32'd0;
             sx      <= 16'd0;
+            emit_div<= 2'd0;
             w_dst   <= 16'd0;
             pad_left<= 16'd0;
             img_end <= 16'd0;
@@ -428,26 +446,32 @@ module img_scaler (
                         //   上下黑边只是填黑，不能动累加器，否则映射会错位
                         if (!black_row) w_acc <= w_acc + {16'b0, I_h};
                         state <= S_NEXT;
-                    end else if (black_row) begin
-                        // ---- 上下黑边：整行直接输出黑，不用取样 ----
-                        O_wr   <= 1'b1;
-                        O_data <= 24'h000000;
-                        dx     <= dx + 16'd1;
+                    end else if (emit_div != 2'd0) begin
+                        // ★ 输出分频的等待拍：本拍不产生 O_wr，给写 FIFO 留排空时间
+                        emit_div <= emit_div - 2'd1;
                     end else begin
-                        O_wr <= 1'b1;
-                        if ((dx < pad_left) || (dx >= img_end)) begin
-                            O_data <= 24'h000000;              // 黑边
+                        emit_div <= EMIT_DIV;   // ★ 吐完这个像素后，再等 EMIT_DIV 拍
+                        if (black_row) begin
+                            // ---- 上下黑边：整行直接输出黑，不用取样 ----
+                            O_wr   <= 1'b1;
+                            O_data <= 24'h000000;
+                            dx     <= dx + 16'd1;
                         end else begin
-                            // ★ 取样地址 = 行基址 rb + 行内列号 sx（模 2048）
-                            O_data <= lbuf[rd_addr];
+                            O_wr <= 1'b1;
+                            if ((dx < pad_left) || (dx >= img_end)) begin
+                                O_data <= 24'h000000;              // 黑边
+                            end else begin
+                                // ★ 取样地址 = 行基址 rb + 行内列号 sx（模 2048）
+                                O_data <= lbuf[rd_addr];
+                            end
+                            // 横向 DDA 前进（只有图像区域内才需要推进）
+                            if ((dx >= pad_left) && (dx < img_end)) begin
+                                h_acc <= h_acc + {16'b0, I_h};
+                                sx    <= sx_next;
+                                c_acc <= c_acc_next;
+                            end
+                            dx <= dx + 16'd1;
                         end
-                        // 横向 DDA 前进（只有图像区域内才需要推进）
-                        if ((dx >= pad_left) && (dx < img_end)) begin
-                            h_acc <= h_acc + {16'b0, I_h};
-                            sx    <= sx_next;
-                            c_acc <= c_acc_next;
-                        end
-                        dx <= dx + 16'd1;
                     end
                 end
 
@@ -461,7 +485,7 @@ module img_scaler (
                     s_acc   <= 32'd0;
                     rb      <= 11'd0;            // ★ 行基址归零，与写指针 wp 对齐
                     if (I_frame_start) begin
-                        // ★【修正】这里必须和 S_IDLE 走完全相同的流程：
+                        // ★ 这里必须和 S_IDLE 走完全相同的流程：
                         //   先 S_HD 重算 H_dst（缩放值可能已经变了），再 S_WD。
                         //   旧版这里直接跳 S_WD 且用写死的 480 算 w_dst，
                         //   导致第 2 张图之后的缩放比例、黑边全都算错 ——

@@ -444,7 +444,7 @@ module txt_read (
                                 txt_err_code <= (char_cnt == 0) ? E_NO_TEXT : E_OK;
                                 state        <= T_DONE;
                             end else if ((char_cnt == 0) && is_blank) begin
-                                // ★【关键修正】正文还没开始，先跳过开头的空格/换行！
+                                // ★ 正文还没开始，先跳过开头的空格/换行！
                                 //   用户的字幕文件通常长这样：
                                 //        #ZIMU#          ← 第 1 行是标记
                                 //        世界计划 ...     ← 第 2 行才是正文

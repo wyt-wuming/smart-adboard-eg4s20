@@ -2,6 +2,8 @@
 //  文件名  : fade_ctrl.v
 //  模块名  : fade_ctrl
 //  功能    : 换图时的"栅格化淡出 / 栅格化淡入"转场特效
+//  时钟域  : video_clk（25MHz）
+//  位置    : image_processor → [fade_ctrl] → osd_adjust（视频流水线第 2 级）
 //------------------------------------------------------------------------------
 //  【对应赛题】加分项②"转场特效 + 音视频联动"
 //
@@ -110,7 +112,6 @@ module fade_ctrl #(
     input  wire        I_en,           // 1 = 启用转场特效
     input  wire        I_load_busy,    // 来自 sd_card_bmp（已同步到 video_clk 域）：正在装载新图
     input  wire [7:0]  I_period_sec,   // ★ 轮播周期（秒）：转场时长 = 周期的 1/10
-    input  wire        I_frame_new,    // 保留口（当前未使用）
     output wire [7:0]  O_gain,         // 音视频联动：背景音乐音量 128~255
 
     // ---------------- 调试输出 ----------------

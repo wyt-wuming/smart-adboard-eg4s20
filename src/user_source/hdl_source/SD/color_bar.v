@@ -1,5 +1,15 @@
 
 `include "video_define.v"
+//==============================================================================
+//  文件名  : color_bar.v
+//  模块名  : color_bar
+//  功能    : 8 段彩条测试图案生成
+//  时钟域  : video_clk（25MHz）
+//  说明    : 参考例程模块（无图可显示时的默认画面）
+//------------------------------------------------------------------------------
+//  所属工程: 基于安路 EG4S20 的智能数字广告牌系统（赛题一 · 2026）
+//==============================================================================
+
 module color_bar(
 	input                 clk,           //pixel clock
 	input                 rst,           //reset signal high active
@@ -140,8 +150,7 @@ reg hs_reg_d0;                   //delay 1 clock of 'hs_reg'
 reg vs_reg_d0;                   //delay 1 clock of 'vs_reg'
 reg[11:0] h_cnt;                 //horizontal counter
 reg[11:0] v_cnt;                 //vertical counter
-reg[11:0] active_x;              //video x position 
-reg[11:0] active_y;              //video y position 
+reg[11:0] active_x;              //video x position
 reg[7:0] rgb_r_reg;              //video red data register
 reg[7:0] rgb_g_reg;              //video green data register
 reg[7:0] rgb_b_reg;              //video blue data register

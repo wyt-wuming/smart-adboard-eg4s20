@@ -1,3 +1,13 @@
+//==============================================================================
+//  文件名  : bmp_read.v
+//  模块名  : bmp_read
+//  功能    : BMP 图片扫描与读取（支持任意尺寸，流式输出像素）
+//  时钟域  : sd_card_clk（100MHz）
+//  说明    : 本作品改造：支持任意宽高(<=2048)+输出真实尺寸 O_img_w/O_img_h 与首像素 O_frame_start，供 img_scaler 缩放
+//------------------------------------------------------------------------------
+//  所属工程: 基于安路 EG4S20 的智能数字广告牌系统（赛题一 · 2026）
+//==============================================================================
+
 module bmp_read(
     input                       clk,
     input                       rst,
@@ -34,7 +44,7 @@ module bmp_read(
     output reg                  bmp_data_wr_en,
     output reg [23:0]           bmp_data,
 
-    // ---------------- ★【新增】源图真实尺寸（给 img_scaler 用）----------------
+    // ---------------- ★ 源图真实尺寸（给 img_scaler 用）----------------
     //   像素流是一维的，缩放器必须知道"一行有多少个像素"才能切行，
     //   以及"一共多少行"才能算纵向缩放比。
     output wire [15:0]          O_img_w,
@@ -42,9 +52,49 @@ module bmp_read(
     output wire                 O_frame_start   // 新图第一个像素（给缩放器复位用）
 );
 
-// 一张图里"第一个有效像素"：像素计数器正好等于像素数据起始偏移的那一拍
-//   （像素有效窗口是 pixel_offset <= cnt < file_len，所以第一拍就是 ==）
-assign O_frame_start = bmp_data_wr_en && (bmp_len_cnt == pixel_offset);
+// ★【重要】下面这几个寄存器必须声明在"第一次使用之前"（就是这里）：
+//   信号若在"使用之后"才声明，综合器会先建一条 1 位宽的隐式线网（HDL-7225），
+//   32 位的比较/选择被截断 → O_frame_start / O_img_w / O_img_h 出错 →
+//   img_scaler 缩放画面错乱（行缓存复位时机错、缩放比例错）。
+//   （原代码把它们声明在文件后部，属于真实隐患，2026-10-05 整理时上移到这里）
+reg [31:0] bmp_len_cnt;     // 像素计数器（当前图已收到的原始像素数）
+reg [31:0] pixel_offset;    // BMP 头解析出的像素数据起始偏移
+reg [31:0] width;           // 源图宽（BMP 头）
+reg [31:0] height;          // 源图高（BMP 头）
+
+// 一张图里"第一个有效像素"：给 img_scaler 当"新一帧开始"的复位脉冲。
+//   ★ 关键时序：像素是 3 个字节拼出来的 ——
+//       2'd0 存 B、2'd1 存 G、2'd2 存 R 并把 bmp_data_wr_en 拉高。
+//     所以当 bmp_data_wr_en 第一次有效时，字节计数器已经走到
+//       pixel_offset + 3（不是 pixel_offset！）
+//   ★ 2026-10-06 修复：原来写成 "== pixel_offset"，该信号**永远为 0** →
+//     img_scaler 永远等不到帧开始（卡在 S_IDLE）→ 图片装载永远不完成
+//     → 屏幕全黑，且图片通路持续占用 SD 总线，音乐也被饿死。
+//--------------------------------------------------------------------------
+//  ★ 为什么把它从 1 拍拉长到 8 拍（2026-10-06 修复）
+//    原来它是 1 拍宽（10ns）的脉冲，而接收方 img_scaler 只在 S_IDLE
+//    状态才会接住它。给一点余量，让它更容易被接住。
+//
+//  ★★ 长度上限有硬约束：**必须远小于源像素的到达间隔（约 106 拍）**！
+//    img_scaler 的内部逻辑是：
+//        else if (I_frame_start) wp <= 11'd1;   // 电平期间每拍都把写指针钉在 1
+//    如果这个电平比像素间隔还长，电平期间到达的像素会被写指针"钉住"，
+//    全部写进同一个位置 → 行缓存数据错位 → 画面异常。
+//    （曾经拉长到 255 拍，超过 106 拍，就踩了这个坑）
+//    8 拍 << 106 拍：只覆盖第一个像素那一下，期间不会有第二个像素到达。
+//--------------------------------------------------------------------------
+reg [7:0] fs_hold;                      // 0 = 无帧开始信号；非 0 = 保持期剩余拍数
+
+always @(posedge clk or posedge rst) begin
+    if (rst)
+        fs_hold <= 8'd0;
+    else if (bmp_data_wr_en && (bmp_len_cnt == (pixel_offset + 32'd3)))
+        fs_hold <= 8'd8;                // 检测到第一个像素 → 保持 8 拍
+    else if (fs_hold != 8'd0)
+        fs_hold <= fs_hold - 8'd1;      // 保持期内逐拍递减
+end
+
+assign O_frame_start = (fs_hold != 8'd0);
 
 // 把 BOM 头里解析出来的真实宽高送出去（原来只用于"和 640x480 比对"，
 // 现在改成送给缩放器当缩放依据）
@@ -60,19 +110,43 @@ localparam ST_LOAD_DATA = 3'd4;
 reg [2:0]  state;
 reg [9:0]  rd_cnt;
 
+//--------------------------------------------------------------------------
+//  ★ 扫描超时兜底（2026-10-06 加）
+//    扫描是逐扇区推进的，大卡扫一遍要几十秒甚至更久，
+//    期间数码管最左位一直停在 2，看起来就像死机。
+//    这里给扫描加一个上限：到点就带着"已经找到的图"继续往下走。
+//    宁可少显示几张，也不要让用户面对一个永远不动的黑屏。
+//--------------------------------------------------------------------------
+localparam [31:0] SCAN_TIMEOUT_MAX = 32'd1_000_000_000;   // 10 秒 @100MHz
+reg [31:0] scan_timeout;
+
+always @(posedge clk or posedge rst) begin
+    if (rst || scan_done)
+        scan_timeout <= 32'd0;
+    else if ((state == ST_SCAN) && (scan_timeout < SCAN_TIMEOUT_MAX))
+        scan_timeout <= scan_timeout + 32'd1;
+end
+
 reg [7:0]  header_0;
 reg [7:0]  header_1;
 reg [31:0] file_len;
-reg [31:0] pixel_offset;
-reg [31:0] width;
-reg [31:0] height;
 reg [15:0] bit_count;
 reg [31:0] compression;
 
 reg [31:0] scan_sector;
 reg [31:0] load_sector_latched;
-reg [31:0] bmp_len_cnt;
 reg [1:0]  bmp_byte_idx;
+
+// ★ BMP 行填充（padding）支持用的寄存器
+//    BMP 规定每行字节数必须是 4 的倍数，不足要在行尾补 0。
+//    宽度 W 不是 4 的倍数时，每行末尾就有若干填充字节，必须跳过，
+//    否则每行都会错位几列 → 画面出现"横向条纹"花屏。
+//    ★ 填充字节数 = W mod 4（因为 3W ≡ -W (mod 4)），直接取 width 的低 2 位即可，
+//      不需要任何乘法器。
+//    col_pix = 本行已经输出到第几个像素；pad_cnt = 本行还要跳过几个填充字节。
+wire [15:0] row_w = (width[15:0] == 16'd0) ? 16'd1 : width[15:0];
+reg [15:0] col_pix;
+reg [1:0]  pad_cnt;
 
 wire header_match;
 wire bmp_data_valid;
@@ -81,7 +155,7 @@ wire [31:0] next_scan_sector_if_match;
 wire [31:0] next_scan_sector_if_miss;
 
 assign ready = (state == ST_IDLE);
-// ★【自适应缩放改造】原来这里要求"宽高必须正好等于 640x480"，
+// ★ 原来这里要求"宽高必须正好等于 640x480"，
 //   不符合的图直接跳过。现在改成"接受任意尺寸"，由下游 img_scaler
 //   负责等比缩放到 480 高。这里只保留几条底线：
 //     ① 必须是标准 24 位、无压缩的 BMP
@@ -177,11 +251,31 @@ end
 always @(posedge clk or posedge rst) begin
     if (rst) begin
         bmp_byte_idx <= 2'd0;
+        col_pix      <= 16'd0;
+        pad_cnt      <= 2'd0;
     end else if (state == ST_LOAD_DATA) begin
-        if (bmp_data_valid)
-            bmp_byte_idx <= (bmp_byte_idx == 2'd2) ? 2'd0 : (bmp_byte_idx + 2'd1);
+        if (pad_cnt != 2'd0) begin
+            // ★ 行尾填充字节：只消耗计数，不组装像素
+            pad_cnt      <= pad_cnt - 2'd1;
+            bmp_byte_idx <= 2'd0;
+        end else if (bmp_data_valid) begin
+            if (bmp_byte_idx == 2'd2) begin
+                bmp_byte_idx <= 2'd0;
+                // 本行最后一个像素组装完了 → 列计数归零，准备跳过行尾填充
+                if (col_pix + 16'd1 >= row_w) begin
+                    col_pix <= 16'd0;
+                    pad_cnt <= width[1:0];      // ★ 填充字节数 = W mod 4
+                end else begin
+                    col_pix <= col_pix + 16'd1;
+                end
+            end else begin
+                bmp_byte_idx <= bmp_byte_idx + 2'd1;
+            end
+        end
     end else begin
         bmp_byte_idx <= 2'd0;
+        col_pix      <= 16'd0;
+        pad_cnt      <= 2'd0;
     end
 end
 
@@ -190,7 +284,10 @@ always @(posedge clk or posedge rst) begin
         bmp_data_wr_en <= 1'b0;
         bmp_data       <= 24'd0;
     end else if (state == ST_LOAD_DATA) begin
-        if (bmp_data_valid) begin
+        if (pad_cnt != 2'd0) begin
+            // ★ 行尾填充字节：不输出像素
+            bmp_data_wr_en <= 1'b0;
+        end else if (bmp_data_valid) begin
             case (bmp_byte_idx)
                 2'd0: begin
                     bmp_data_wr_en <= 1'b0;
@@ -267,7 +364,11 @@ always @(posedge clk or posedge rst) begin
                 state_code  <= 4'd2;
                 sd_sec_read <= 1'b1;
 
-                if (sd_sec_read_end) begin
+                // ★ 扫描超时兜底：到点就用"已经找到的图"继续往下走
+                if (scan_timeout >= SCAN_TIMEOUT_MAX) begin
+                    scan_done <= 1'b1;
+                    state     <= ST_IDLE;
+                end else if (sd_sec_read_end) begin
                     sd_sec_read <= 1'b0;
 
                     if (header_match) begin

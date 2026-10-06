@@ -1,4 +1,14 @@
 
+//==============================================================================
+//  文件名  : sd_card_top.v
+//  模块名  : sd_card_top
+//  功能    : SD 卡控制器顶层（SPI 模式）
+//  时钟域  : sd_card_clk（100MHz）
+//  说明    : 参考例程模块；内部含 spi_master + sd_card_cmd + sd_card_sec_read_write。本设计在顶层只例化这一份，供图片/音乐/字幕三通道分时复用
+//------------------------------------------------------------------------------
+//  所属工程: 基于安路 EG4S20 的智能数字广告牌系统（赛题一 · 2026）
+//==============================================================================
+
 module sd_card_top
 #(
 	parameter  SPI_LOW_SPEED_DIV = 248,         // SD card low speed mode frequency division parameter,spi clk speed = clk speed /((SPI_LOW_SPEED_DIV + 2) * 2 )
