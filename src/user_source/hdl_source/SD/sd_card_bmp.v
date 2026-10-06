@@ -127,11 +127,11 @@ reg              next_req_pending;
 //
 //   ★★ 阈值必须足够大，否则会"自己打断自己"：
 //      一张 640x480 的 BMP = 921654 字节 = 1800 个扇区，
-//      SD 卡单块读的响应延迟约 1~2ms/扇区 → 整张图要 3.6 秒左右。
-//      （曾经设成 2.7 秒：装载读到一半就被超时打断 → load_busy 被清 →
+//      连续 CMD17 读约 184µs/扇区（见 sd_bus_arbiter 注释）→ 整张约 350ms。
+//      （历史教训：曾设成 2.7 秒时被打断过 → load_busy 被清 →
 //        系统重新发起装载 → 又被打断，无限循环，
 //        表现是数码管最左位一直停在 4、画面永远全黑。）
-//   现在给到 30 秒，正常装载 3.6 秒只用掉零头，纯粹当保险。
+//   现在给到 30 秒，正常装载 350ms 只用掉零头，纯粹当保险。
 localparam [31:0] LOAD_TIMEOUT_MAX = 32'd3_000_000_000;   // 30 秒 @100MHz
 reg [31:0]       load_timeout;
 reg              load_busy;
@@ -141,13 +141,24 @@ reg              load_busy;
 localparam [26:0] RELOAD_GAP = 27'd40_000_000;   // 两次重载之间至少隔 400ms
 
 // ★ "静默重载"（2026-10-06 加）
-//   每重载一次都要把源图从 SD 卡重读一遍（约 3.6 秒），
-//   如果"每按一下就重载一次"，从 100% 调到 50% 要按 10 次 → 等 36 秒，没法用。
+//   每重载一次都要把源图从 SD 卡重读一遍（约 350ms），
+//   如果"每按一下就重载一次"，从 100% 调到 50% 要按 10 次 → 等约 4 秒（350ms 装载 + 400ms 节流），
+//   而且长按连发时装载里穿插重载，画面一直卡在"装载中"。
 //   改成：连按期间只更新数值、并不断重置这个静默计时器；
 //        松手（数值 500ms 不变）之后才真正重载一次。
-//   同样的操作从 36 秒降到约 4 秒。
+//   同样的操作降到约 1 秒（500ms 静默 + 350ms 装载）。
 localparam [26:0] ZOOM_QUIET_GAP = 27'd50_000_000;   // 500ms 静默 @100MHz
+
+// ★ "强制刷新兜底"（2026-10-06 排查"缩放跳跃异常"后加）
+//   静默期能防"连按时疯狂重载"，但也会把长按期间的刷新全挡死：
+//   长按每 150ms 连发一次，zoom_quiet 不停被清零 → 永远到不了 500ms
+//   → 重载永远不发起 → 画面死卡（系统空闲，数码管位5=1），
+//   松手后 500ms 静默 + 一次装载才突然跳到目标，体感"坏掉"。
+//   兜底：zoom_pending 置 1 后单独计时，连按不清零；
+//   满 800ms 还没能重载就强制用当前值刷一次 → 画面慢半拍跟手。
+localparam [26:0] ZOOM_FORCE_GAP = 27'd80_000_000;   // 连按 800ms 强制刷新 @100MHz
 reg [26:0]       zoom_quiet;      // 距上次缩放值变化过了多久
+reg [26:0]       zoom_force_cnt;  // ★ zoom_pending 已持续多久（连按不清零）
 reg [7:0]        zoom_d;          // 上一拍的缩放值（用来检测变化）
 reg              zoom_pending;    // 1 = 缩放值变过、还没重载
 reg              reload_ok;       // 1 = 允许重载（节流门闩）
@@ -306,6 +317,7 @@ always @(posedge clk or posedge rst) begin
         zoom_d                <= 8'd100;
         zoom_pending          <= 1'b0;
         zoom_quiet            <= 27'd0;
+        zoom_force_cnt        <= 27'd0;
         reload_ok             <= 1'b1;
         reload_cnt            <= 27'd0;
     end else begin
@@ -332,6 +344,16 @@ always @(posedge clk or posedge rst) begin
             zoom_quiet <= zoom_quiet + 27'd1;    // 数值稳定了 → 开始累计静默时间
         end
         zoom_d <= I_zoom_pct;
+
+        // ★ 强制刷新兜底：pending 一置位就开始计时，连按期间不清零。
+        //   静默期把长按期间的刷新全挡死时，满 800ms 强制用当前值刷一次。
+        //   （读的是 pending 旧值：重载发起那拍 pending 还是 1，计数器继续；
+        //    下一拍 pending 变 0，这里就自动清零，不需要显式复位。）
+        if (zoom_pending)
+            zoom_force_cnt <= (zoom_force_cnt < ZOOM_FORCE_GAP)
+                              ? zoom_force_cnt + 27'd1 : zoom_force_cnt;
+        else
+            zoom_force_cnt <= 27'd0;
 
         if (reload_ok)
             reload_cnt <= 27'd0;
@@ -492,7 +514,8 @@ always @(posedge clk or posedge rst) begin
                 //   优先级放在自动播放之下：正在换图/轮播时不插队，等空下来再重载。
                 else if (scan_done && bmp_ready && display_valid && !load_busy
                          && zoom_pending && reload_ok
-                         && (zoom_quiet >= ZOOM_QUIET_GAP)           // ★ 等用户停手 500ms
+                         && ((zoom_quiet >= ZOOM_QUIET_GAP)          // ★ 等用户停手 500ms
+                             || (zoom_force_cnt >= ZOOM_FORCE_GAP))  // ★ 或连按 800ms 强制刷新
                          && (img_found_count != 3'd0)) begin
                     load_idx         <= img_idx;                  // ★ 还是当前这张
                     load_sector      <= sector_lut(img_idx);
