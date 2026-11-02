@@ -7,19 +7,19 @@ if hasattr(sys.stdout, 'reconfigure'):
 ==============================================================================
  文件名 : 仿真_缩放跳跃.py
  功能   : 逐拍仿真 sd_card_bmp.v 的"缩放重载决策逻辑"
-          （★ 含 500ms 静默期 + 400ms 强制刷新兜底，即 2026-10-06 修复后的当前 RTL）
+          （★ 含 300ms 静默期 + 400ms 强制刷新兜底，即 2026-10-31 的当前 RTL）
           排查现象："按住连按几十下 → 画面卡住不动 → 数码管位5=1（空闲）→
                     等很久才到达目标缩放大小"
 ------------------------------------------------------------------------------
  与 sd_card_bmp.v 的对应（改 RTL 后请同步改这里）：
    ① 变化检测  ：I_zoom_pct != zoom_d → zoom_pending=1、zoom_quiet=0
-   ② 静默计时  ：数值稳定时 zoom_quiet 递增，满 500ms 才允许重载
+   ② 静默计时  ：数值稳定时 zoom_quiet 递增，满 300ms 才允许重载
    ③ 强制兜底  ：zoom_force_cnt 随 pending 持续计时（连按不清零），
                   满 400ms 还没重载就强制刷一次
    ④ 节流门闩  ：reload_ok，发起重载后 400ms 内不允许再重载
    ⑤ 重载分支  ：scan_done & bmp_ready & display_valid & !load_busy
                   & zoom_pending & reload_ok
-                  & (zoom_quiet>=500ms || zoom_force_cnt>=400ms)
+                  & (zoom_quiet>=300ms || zoom_force_cnt>=400ms)
                   & img_found_count != 0
    ⑥ 装载耗时  ：350ms（一次 BMP 装载，期间 bmp_ready=0）
 
@@ -33,20 +33,24 @@ if hasattr(sys.stdout, 'reconfigure'):
 """
 
 GAP_MS = 400          # 两次重载最小间隔（RELOAD_GAP，@100MHz = 40M 拍）
-QUIET_MS = 500        # 缩放值静默期（ZOOM_QUIET_GAP = 50M 拍）
+QUIET_MS = 300        # 缩放值静默期（ZOOM_QUIET_GAP = 30M 拍，2026-10-31 由 500 缩短）
 FORCE_MS = 400        # 连按强制刷新兜底（ZOOM_FORCE_GAP = 40M 拍，2026-10-06 由 800 缩短）
 LOAD_MS = 350         # 一次 BMP 装载耗时（实测约 350ms）
 REPEAT_MS = 150       # 按键长按连发间隔（key_press_event REPEAT_MS）
 STEP_PCT = 5          # 每按一下缩放变化 ±5%（key_ctrl_fsm ZOOM_STEP）
 
 
-def sim(changes, t_end_ms, quiet_enable=True, force_gap_ms=FORCE_MS):
+def sim(changes, t_end_ms, quiet_enable=True, force_gap_ms=FORCE_MS,
+        quiet_ms=None):
     """changes: {时刻ms: 新的缩放值}。返回 (重载列表, 空闲ms数)。
 
     quiet_enable=False  → 旧行为（加静默期之前，无静默无兜底）；
-    force_gap_ms =None → 2026-10-06 中间版（只有 500ms 静默，只挡不兜）；
-    force_gap_ms =数值 → 当前 RTL（静默 + 强制刷新兜底）。
+    force_gap_ms =None → 2026-10-06 中间版（只有静默期，只挡不兜）；
+    force_gap_ms =数值 → 当前 RTL（静默 + 强制刷新兜底）；
+    quiet_ms =None     → 用当前 RTL 的静默期（QUIET_MS）；
+    quiet_ms =数值     → 指定静默期（历史版本对照用，如 500ms）。
     """
+    qms = QUIET_MS if quiet_ms is None else quiet_ms
     z = 100
     zoom_d, pending, quiet, ok, cnt = 100, 0, 0, 1, 0
     fcnt = 0               # 候选修复：zoom_pending 已持续的时长（不受 quiet 清零影响）
@@ -61,7 +65,7 @@ def sim(changes, t_end_ms, quiet_enable=True, force_gap_ms=FORCE_MS):
         # ---- ① 变化检测 + 静默计时（与 RTL 同序）----
         if z != zoom_d:
             pending, quiet = 1, 0
-        elif quiet < QUIET_MS:
+        elif quiet < qms:
             quiet += 1
         zoom_d = z
         # ---- ①b 候选修复：强制刷新计时（pending 持续计时，连按不清零）----
@@ -81,10 +85,10 @@ def sim(changes, t_end_ms, quiet_enable=True, force_gap_ms=FORCE_MS):
         #      img_found_count!=0；装载期间 load_busy=1 已挡掉）----
         cond = (not load_busy) and pending and ok
         if quiet_enable:
-            cond = cond and (quiet >= QUIET_MS)
+            cond = cond and (quiet >= qms)
         if force_gap_ms is not None and quiet_enable:
             cond = (not load_busy) and pending and ok \
-                and (quiet >= QUIET_MS or fcnt >= force_gap_ms)
+                and (quiet >= qms or fcnt >= force_gap_ms)
         if cond:
             issued.append((t, z))
             pending, ok, cnt = 0, 0, 0
@@ -165,7 +169,7 @@ def case(name, changes, t_end, want_n, want_last, idle_hold_ge_ms=0,
 
 
 print('=' * 70)
-print('  缩放重载决策逻辑仿真（★ 含 500ms 静默期 + 400ms 强制刷新兜底）')
+print('  缩放重载决策逻辑仿真（★ 含 300ms 静默期 + 400ms 强制刷新兜底）')
 print('  时间刻度 1ms；对应 2026-10-06 修复后的 sd_card_bmp.v')
 print('=' * 70)
 print()
@@ -194,13 +198,13 @@ case('场景 3：按住 8 下(→140) → 停 700ms → 按住 8 下(→180) →
 
 # ---------------------------------------------------------------- 场景 4
 # 装载期间又按：重载发起后 200ms（装载 350ms 还没完）再按一下
-# 预期：第 1 次重载完成（画面 105）后，再等 500ms 静默，第 2 次重载 → 110
+# 预期：第 1 次重载完成（画面 105）后，再等静默期/兜底，第 2 次重载 → 110
 case('场景 4：重载进行到一半（200ms）时又按一下',
      {1000: 105, 1700: 110}, 5000, want_n=2, want_last=110, want_mid=[105, 110])
 
 # ---------------------------------------------------------------- 场景 5
 # 大步长单次跳变（排除"采到旧值"）：200% 回绕到 50%，一次跳 150%
-# 重载发起时值已静默 500ms，img_scaler 采样必为新值 → 画面最终 50%
+# 重载发起时值已静默满期，img_scaler 采样必为新值 → 画面最终 50%
 case('场景 5：单次大跳变 200%→50%（回绕），方向B排除证据',
      {1000: 50}, 4000, want_n=1, want_last=50)
 
@@ -216,7 +220,7 @@ print('=' * 70)
 print('  对照：四个版本的场景 1 行为')
 print('=' * 70)
 r_none, _ = sim(s1, 12000, quiet_enable=False)     # 版本 A：加静默期之前
-r_quiet, _ = sim(s1, 12000, force_gap_ms=None)     # 版本 B：只挡不兜（本次排查的 bug）
+r_quiet, _ = sim(s1, 12000, force_gap_ms=None, quiet_ms=500)   # 版本 B：只挡不兜（历史 500ms 版）
 r_fix8, _ = sim(s1, 12000, force_gap_ms=800)       # 版本 C：兜底 800ms（初版修复，用户嫌慢）
 r_fix, _ = sim(s1, 12000)                          # 版本 D：当前 RTL（兜底 400ms）
 print('  版本 A 无静默（最早）      ：%d 次重载，装载总耗时 %dms —— 按住 4500ms 里疯狂重载'

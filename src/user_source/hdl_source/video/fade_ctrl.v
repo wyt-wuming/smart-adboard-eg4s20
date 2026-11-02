@@ -28,11 +28,19 @@
 //    观感上和交叉淡化很接近，而且是业界常见做法（很多电视、投影仪就用这个）。
 //
 //  【★ 时序怎么对上装载过程】
-//    整个过渡由 sd_card_bmp 的 load_busy 信号驱动：
-//        ① load_busy 上升沿（开始装载新图）→ 进入 F_OUT，旧图栅格淡出
+//    整个过渡由 sd_card_bmp 的 I_img_switch 信号驱动
+//    （I_img_switch = load_busy && 正在装的图 ≠ 当前显示的图）：
+//        ① I_img_switch 上升沿（开始装载"另一张图"）→ 进入 F_OUT，旧图栅格淡出
 //        ② 淡出做完 → F_WAIT，屏幕全黑，等新图装完
 //        ③ load_busy 下降沿（新图装完，帧缓存已切换）→ 进入 F_IN，新图栅格淡入
 //        ④ 淡入做完 → 回 F_IDLE，正常显示
+//
+//    ★ 为什么不是 load_busy 的上升沿？
+//      缩放重载（同一张图换比例）也拉 load_busy，但它不是"换图"，
+//      不需要黑场过渡 —— 画面直接切换才是"跟手"的正确观感。
+//      若缩放重载也触发转场：连续重载节奏约 450ms，比转场全程还短，
+//      转场会连环触发/错过，画面不停"淡出→黑→淡入"，
+//      上板现象就是"缩放很多次后黑屏、显示放缩前的大小、很久才到位"。
 //
 //    ★ 淡出总时长必须比"装载时间"短！
 //      这里淡出只有 215ms，而 640x480 BMP 装载约 350ms，有 135ms 余量。
@@ -111,6 +119,7 @@ module fade_ctrl #(
     // ---------------- 控制 ----------------
     input  wire        I_en,           // 1 = 启用转场特效
     input  wire        I_load_busy,    // 来自 sd_card_bmp（已同步到 video_clk 域）：正在装载新图
+    input  wire        I_img_switch,   // ★ 来自 sd_card_bmp（已同步）：正在装载"另一张图"（换图才转场）
     input  wire [7:0]  I_period_sec,   // ★ 轮播周期（秒）：转场时长 = 周期的 1/10
     output wire [7:0]  O_gain,         // 音视频联动：背景音乐音量 128~255
 
@@ -220,13 +229,13 @@ module fade_ctrl #(
         end
     end
 
-    // ★ load_busy 的上升沿检测（见 F_IDLE 的说明，这是"转场爆掉"的根因）
-    reg load_busy_d;
-    wire load_rise = I_load_busy & ~load_busy_d;
+    // ★ "换图装载开始"的上升沿检测（见 F_IDLE 的说明，这是"转场爆掉"的根因）
+    reg img_switch_d;
+    wire img_switch_rise = I_img_switch & ~img_switch_d;
 
     always @(posedge video_clk or posedge rst) begin
-        if (rst) load_busy_d <= 1'b0;
-        else     load_busy_d <= I_load_busy;
+        if (rst) img_switch_d <= 1'b0;
+        else     img_switch_d <= I_img_switch;
     end
 
     always @(posedge video_clk or posedge rst) begin
@@ -252,7 +261,9 @@ module fade_ctrl #(
                     //     于是立刻又触发一轮淡出 → 淡入 → 淡出 …
                     //     屏幕疯狂闪烁，就是"转场爆掉"。
                     //   改成上升沿后：只有"新一次装载开始"才会启动转场。
-                    if (load_rise) fstate <= F_OUT;
+                    //   而且必须是 I_img_switch（换图）的上升沿：
+                    //   缩放重载的 load_busy 上升沿不算换图，不触发转场。
+                    if (img_switch_rise) fstate <= F_OUT;
                 end
 
                 //----------------------------------------------------------

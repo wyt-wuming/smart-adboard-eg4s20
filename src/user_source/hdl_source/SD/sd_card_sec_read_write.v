@@ -64,6 +64,38 @@ localparam S_CMD16              = 18;
 reg[4:0]                       state;
 reg[31:0]                      sec_addr;
 
+// ★ 状态停留超时 —— SD 通信故障自愈（2026-10-31 加）
+//   现象：缩放等高频读卡场景下，某次 SD 命令无响应（卡进入通信中断的
+//         中间态 / 电源波动 / 时序临界）→ 状态机停在命令状态无限重试 →
+//         sd_init_done 恒 0（数码管位5=0）、画面卡旧图、必须断电重启。
+//   处理：初始化完成后的"运行阶段"，任何工作状态停留超过 300ms，
+//         强制回 S_IDLE 重新初始化，并重新走 100ms 上电等待。
+//         卡恢复后系统自动重新扫描、重新显示，不需要人工重启。
+//
+//   ★★ 两个关键约束（第一版踩过坑）：
+//   1. 只在 sd_init_done=1（初始化完成后）才启用超时！
+//      初始化阶段卡可能几百毫秒才响应 CMD41（卡内部上电初始化），
+//      超时若在初始化阶段生效，会把"慢卡"当故障反复掐掉 →
+//      永远初始化不完 → 烧写后直接黑屏（位5=0）。
+//   2. 阈值 300ms：运行中正常命令/读写单状态停留只有 µs~ms 级，
+//      300ms 远大于正常值，不会误触发。
+localparam [27:0] STALL_MAX = 28'd30_000_000;   // 300ms @100MHz
+reg [4:0]                      state_d;
+reg [27:0]                     stall_cnt;
+
+always @(posedge clk or posedge rst) begin
+	if (rst) begin
+		state_d   <= S_IDLE;
+		stall_cnt <= 28'd0;
+	end else begin
+		state_d <= state;
+		if (state != state_d)
+			stall_cnt <= 28'd0;              // 状态一变就重新计时
+		else if (stall_cnt < STALL_MAX)
+			stall_cnt <= stall_cnt + 28'd1;
+	end
+end
+
 // ★ 上电等待计数器（2026-10-06 加）
 //   SD 卡规范要求：上电稳定至少 1ms 之后才能收第一条命令，且要给它 74 个以上时钟。
 //   原来复位一放开就立刻发 CMD0，遇到"卡还处在上次通信中断的中间态"时，
@@ -94,6 +126,21 @@ begin
 		sec_addr <= 32'd0;
 		sd_init_done <= 1'b0;
 		pwr_wait <= 28'd0;
+	end
+	else if ((stall_cnt >= STALL_MAX) &&
+	         sd_init_done &&                        // ★ 只在初始化完成后的运行阶段启用！
+	         (state != S_IDLE) &&
+	         (state != S_WAIT_READ_WRITE))
+	begin
+		// ★ SD 通信故障自愈：运行中工作状态卡住超过 300ms → 强制重新初始化。
+		//   清掉所有命令/读写请求，回到 S_IDLE 重新走 100ms 上电等待；
+		//   卡一旦恢复，初始化成功，上层自动重新扫描并恢复显示。
+		state           <= S_IDLE;
+		cmd_req         <= 1'b0;
+		block_read_req  <= 1'b0;
+		block_write_req <= 1'b0;
+		sd_init_done    <= 1'b0;
+		pwr_wait        <= 28'd0;
 	end
 	else
 		case(state)

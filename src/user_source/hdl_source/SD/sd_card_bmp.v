@@ -47,6 +47,7 @@ module sd_card_bmp #(
 
     // ---- ★ 给 OSD / 转场模块用的状态输出 ----
     output                      O_load_busy,      // 正在装载新图（转场淡出用）
+    output                      O_img_switch,     // ★ 1 = 正在装载"另一张图"（换图才转场，缩放重载不算）
     output                      O_auto_play_en,   // 自动轮播是否开启（OSD 显示用）
     output [2:0]                O_img_idx,        // 当前显示第几张（OSD 显示用）★ 2→3 位
     output [2:0]                O_img_found_count,// 共找到几张图（OSD 显示用）
@@ -145,13 +146,15 @@ localparam [26:0] RELOAD_GAP = 27'd40_000_000;   // 两次重载之间至少隔 
 //   如果"每按一下就重载一次"，从 100% 调到 50% 要按 10 次 → 等约 4 秒（350ms 装载 + 400ms 节流），
 //   而且长按连发时装载里穿插重载，画面一直卡在"装载中"。
 //   改成：连按期间只更新数值、并不断重置这个静默计时器；
-//        松手（数值 500ms 不变）之后才真正重载一次。
-//   同样的操作降到约 1 秒（500ms 静默 + 350ms 装载）。
-localparam [26:0] ZOOM_QUIET_GAP = 27'd50_000_000;   // 500ms 静默 @100MHz
+//        松手（数值 300ms 不变）之后才真正重载一次。
+//   同样的操作降到约 0.7 秒（300ms 静默 + 350ms 装载）。
+//   （2026-10-31：静默期由 500ms 缩短到 300ms —— 单按响应由约 750ms
+//     降到约 650ms；连按间隔 150ms 本来走 400ms 强制兜底，行为不变。）
+localparam [26:0] ZOOM_QUIET_GAP = 27'd30_000_000;   // 300ms 静默 @100MHz
 
 // ★ "强制刷新兜底"（2026-10-06 排查"缩放跳跃异常"后加）
 //   静默期能防"连按时疯狂重载"，但也会把长按期间的刷新全挡死：
-//   长按每 150ms 连发一次，zoom_quiet 不停被清零 → 永远到不了 500ms
+//   长按每 150ms 连发一次，zoom_quiet 不停被清零 → 永远到不了静默期
 //   → 重载永远不发起 → 画面死卡（系统空闲，数码管位5=1），
 //   松手后 500ms 静默 + 一次装载才突然跳到目标，体感"坏掉"。
 //   兜底：zoom_pending 置 1 后单独计时，连按不清零；
@@ -341,7 +344,7 @@ always @(posedge clk or posedge rst) begin
         //                 真正发起重载时才清零 → 松手后画面一定是新比例。
         //   reload_ok   ：节流门闩，发起重载时清零，400ms 后自动置 1。
         //------------------------------------------------------------------
-        // ★ 缩放值检测 + 静默计时（连按时不断重置，停手 500ms 后才允许重载）
+        // ★ 缩放值检测 + 静默计时（连按时不断重置，停手 300ms 后才允许重载）
         if (I_zoom_pct != zoom_d) begin
             zoom_pending <= 1'b1;
             zoom_quiet   <= 27'd0;               // 数值刚变 → 静默计时清零
@@ -501,25 +504,17 @@ always @(posedge clk or posedge rst) begin
                     auto_sec_cnt     <= 16'd0;
                     zoom_pending     <= 1'b0;   // ★ 这次装载已经用了最新缩放值
                 end
-                // 自动播放下一张：同样写到“非当前显示”的另一块 buffer
-                else if (scan_done && bmp_ready && display_valid && !load_busy && auto_play_en && auto_tick && (img_found_count > 3'd1)) begin
-                    load_idx         <= next_from_current;
-                    load_sector      <= sector_lut(next_from_current);
-                    pending_buf_idx  <= next_buf_lut(disp_buf_idx, display_valid);
-                    write_buf_idx    <= next_buf_lut(disp_buf_idx, display_valid);
-                    load_start_pulse <= 1'b1;
-                    load_busy        <= 1'b1;
-                    source_done_seen <= 1'b0;
-                    auto_sec_cnt     <= 16'd0;
-                    zoom_pending     <= 1'b0;   // ★ 这次装载已经用了最新缩放值
-                end
                 // ★ 缩放值变化 → 重载"当前这一张"
                 //   写在"非当前显示"的另一块 buffer 里，显示画面完全不受影响，
                 //   装载完成后由 write_finish_toggle 那一拍统一切换。
-                //   优先级放在自动播放之下：正在换图/轮播时不插队，等空下来再重载。
+                //   ★ 优先级：手动切图 > 缩放重载 > 自动轮播（2026-10-31 调整）。
+                //   缩放是"用户正在主动操作"的事，自动轮播是后台行为，
+                //   调缩放时轮播必须让路——否则轮播装载抢占总线，
+                //   缩放调节要等轮播间隙，表现就是"时快时慢"。
+                //   轮播让路期间 auto_tick 保持为 1，缩放完成/松手后立即补上。
                 else if (scan_done && bmp_ready && display_valid && !load_busy
                          && zoom_pending && reload_ok
-                         && ((zoom_quiet >= ZOOM_QUIET_GAP)          // ★ 等用户停手 500ms
+                         && ((zoom_quiet >= ZOOM_QUIET_GAP)          // ★ 等用户停手 300ms
                              || (zoom_force_cnt >= ZOOM_FORCE_GAP))  // ★ 或连按 400ms 强制刷新
                          && (img_found_count != 3'd0)) begin
                     load_idx         <= img_idx;                  // ★ 还是当前这张
@@ -534,6 +529,18 @@ always @(posedge clk or posedge rst) begin
                     zoom_pending     <= 1'b0;   // 已按最新比例重载
                     reload_ok        <= 1'b0;   // ★ 节流门闩：400ms 内不许再重载
                     reload_cnt       <= 27'd0;
+                end
+                // 自动播放下一张：同样写到“非当前显示”的另一块 buffer
+                else if (scan_done && bmp_ready && display_valid && !load_busy && auto_play_en && auto_tick && (img_found_count > 3'd1)) begin
+                    load_idx         <= next_from_current;
+                    load_sector      <= sector_lut(next_from_current);
+                    pending_buf_idx  <= next_buf_lut(disp_buf_idx, display_valid);
+                    write_buf_idx    <= next_buf_lut(disp_buf_idx, display_valid);
+                    load_start_pulse <= 1'b1;
+                    load_busy        <= 1'b1;
+                    source_done_seen <= 1'b0;
+                    auto_sec_cnt     <= 16'd0;
+                    zoom_pending     <= 1'b0;   // ★ 这次装载已经用了最新缩放值
                 end
             end
         end
@@ -608,11 +615,16 @@ img_scaler u_img_scaler (
 //  ★ 内部状态引出
 //    这些信号原本只在模块内部使用，现在引出来给上层用：
 //      O_load_busy       → fade_ctrl（转场模块）据此提前开始淡出
+//      O_img_switch      → ★ fade_ctrl 换图才转场（缩放重载不转场，见 fade_ctrl 注释）
 //      O_auto_play_en    → OSD 叠加显示自动轮播状态
 //      O_img_idx         → OSD 显示 "IMG x/4"
 //      O_img_found_count → OSD 显示总数
 //==========================================================================
 assign O_load_busy       = load_busy;
+// ★ "正在装载另一张图" = 装载中且目标图号 ≠ 当前显示图号。
+//   换图/轮播/切图：load_idx != img_idx → 1（转场）；
+//   缩放重载（还是当前这张）与首图装载：相等 → 0（不转场，直接切换）。
+assign O_img_switch      = load_busy && (load_idx != img_idx);
 assign O_auto_play_en    = auto_play_en;
 assign O_img_idx         = img_idx;
 assign O_img_found_count = img_found_count;

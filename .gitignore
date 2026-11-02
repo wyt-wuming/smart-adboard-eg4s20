@@ -4,7 +4,7 @@
 #  这样 git 仓库保持轻量，且能一键回退到任意改造阶段
 # ============================================================
 
-# ---- 演示视频（250MB，与源码无关）----
+# ---- 演示视频（与源码无关）----
 演示视频/
 
 # ---- TD 综合/布局布线产物（可重新生成，约 24MB）----
@@ -15,6 +15,23 @@ src/td_project/log/
 *.dmp
 *.log
 *.logw
+.lock.f
+.recent_user_depot.ini
 
-# ---- 未使用的大体积音频素材（改造时用不到，约 20MB）----
-src/user_source/hdl_source/python/song_48k.*
+# ---- 例程遗留的大体积音频/ROM 素材（工程已不再使用）----
+src/user_source/hdl_source/python/*.wav
+src/user_source/hdl_source/python/*.mif
+src/user_source/hdl_source/python/*.mif.dath
+
+# ---- 厂商官方文档（版权原因不纳入公开仓库）----
+doc/APUG092_HDMI1.4b_Transmitter_V1.0.docx
+
+# ---- 图片素材与转换输出（可自行重新生成）----
+doc/convert/*.png
+doc/convert/*.bmp
+doc/convert/output_bmp/
+doc/TF卡图片/
+
+# ---- 系统临时文件 ----
+Thumbs.db
+.DS_Store

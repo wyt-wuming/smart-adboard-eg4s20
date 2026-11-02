@@ -539,6 +539,7 @@ wire        audio_fifo_re;
 // ===================== TF 多图扫描与缓存（双缓冲） =====================
 // 新增的状态输出线（供 OSD / 转场使用）
 wire        load_busy_sd;         // 正在装载新图
+wire        img_switch_sd;        // ★ 正在装载"另一张图"（换图才转场）
 wire        auto_play_en_sd;      // 自动轮播开关状态
 wire [2:0]  img_idx_sd;           // 当前第几张（★ 2→3 位，支持更多图）
 wire [2:0]  img_found_count_sd;   // 共几张
@@ -575,6 +576,7 @@ sd_card_bmp #(
 
     // ★ 新增状态输出
     .O_load_busy       (load_busy_sd),
+    .O_img_switch      (img_switch_sd),  // ★ 换图装载标志（转场只对换图触发）
     .O_auto_play_en    (auto_play_en_sd),
     .O_img_idx         (img_idx_sd),
     .O_img_found_count (img_found_count_sd),
@@ -867,6 +869,12 @@ audio_player #(
     .O_frame_cnt        (aud_frame_cnt)
 );
 
+// ★ 静音门控后的音频数据（SW3 关闭时数据置 0，aud_valid 规律不变）
+//   ★ 必须在这里先声明：audio_wave_osd 在下方（字幕之后）例化，
+//     否则会被综合器当成 1 位隐式线网（HDL-7225），波形数据被截断。
+wire [23:0] aud_left_out  = vcfg_music_en ? aud_left  : 24'd0;
+wire [23:0] aud_right_out = vcfg_music_en ? aud_right : 24'd0;
+
 // =========================================================================
 //  数码管显示（★ 改造：由 seg_display 统一合成 6 位内容）
 // -------------------------------------------------------------------------
@@ -1036,14 +1044,19 @@ image_processor u_image_processor (
 //    本模块在 video_clk = 25MHz 域，必须打两拍同步后再用。
 // =========================================================================
 reg load_busy_s1, load_busy_s2;
+reg img_switch_s1, img_switch_s2;
 
 always @(posedge video_clk or posedge rst_all) begin
     if (rst_all) begin
-        load_busy_s1 <= 1'b0;
-        load_busy_s2 <= 1'b0;
+        load_busy_s1  <= 1'b0;
+        load_busy_s2  <= 1'b0;
+        img_switch_s1 <= 1'b0;
+        img_switch_s2 <= 1'b0;
     end else begin
-        load_busy_s1 <= load_busy_sd;    // 100MHz 域
-        load_busy_s2 <= load_busy_s1;    // 25MHz 域
+        load_busy_s1  <= load_busy_sd;    // 100MHz 域
+        load_busy_s2  <= load_busy_s1;    // 25MHz 域
+        img_switch_s1 <= img_switch_sd;
+        img_switch_s2 <= img_switch_s1;
     end
 end
 
@@ -1068,6 +1081,7 @@ fade_ctrl u_fade_ctrl (
     // 把这里改成对应的配置位即可（video 配置字 bit[0] 还是空的）。
     .I_en        (1'b1),
     .I_load_busy (load_busy_s2),
+    .I_img_switch(img_switch_s2),      // ★ 换图才转场（缩放重载不转场，直接切换）
     .I_period_sec(cfg_period_sec_v),   // ★ 转场时长 = 轮播周期的 1/10
     .O_gain      (fade_gain),      // 预留：音视频联动（当前未接进 audio_player）
     .O_state     ()                // 调试状态，未使用
@@ -1142,7 +1156,36 @@ marquee_osd #(
     .O_text_len(marq_text_len)
 );
 
-assign vout_data = vout_marq;
+// =========================================================================
+//  ★ 音频波形显示（2026-10-22 新增）：字幕上方的绿色波形图
+//    插在流水线最后一级（字幕之后、AXIS 之前），内部延迟 2 拍。
+//    波形区 x=64~575、中心线 y=418；字幕底条从 y=440 起，互不遮挡。
+//    无开关：音乐关时数据已被 SW3 门控为 0 → 波形自动变成一条直线。
+//    波形缓存 512x8bit 用 LUT RAM（变量地址异步读），不占用块 RAM。
+// =========================================================================
+wire [23:0] vout_wave;
+wire        hs_wave, vs_wave, de_wave;
+
+audio_wave_osd u_audio_wave_osd (
+    .video_clk (video_clk),
+    .rst       (rst_all),
+    .I_valid   (aud_valid),
+    .I_left    (aud_left_out),
+    .I_right   (aud_right_out),
+    .I_de      (de_marq),
+    .I_hs      (hs_marq),
+    .I_vs      (vs_marq),
+    .I_rgb     (vout_marq),
+    .O_de      (de_wave),
+    .O_hs      (hs_wave),
+    .O_vs      (vs_wave),
+    .O_rgb     (vout_wave),
+    // ★ 调节模式（SW1=ON）时隐藏波形，画面干净、方便观察调节效果；
+    //   运行模式下才显示波形（音乐关时是一条直线）
+    .I_show    (~vcfg_adj_mode)
+);
+
+assign vout_data = vout_wave;
 
 frame_read_write #(
     .WRITE_V_FLIP     (1),
@@ -1235,8 +1278,8 @@ audio_arc_calculate #(
 video_rgb_to_axis_640x480 u_video_rgb_to_axis_640x480(
     .I_clk         (video_clk),
     .I_rst         (rst_all),
-    .I_vs          (vs_marq),      // ★ 必须用最后一级(传送带)输出的同步信号
-    .I_de          (de_marq),      //   —— 它比 vs_osd/de_osd 又晚 4 拍
+    .I_vs          (vs_wave),      // ★ 必须用最后一级(波形)输出的同步信号
+    .I_de          (de_wave),      //   —— 它比 vs_marq/de_marq 又晚 2 拍
     .I_rgb         (vout_data),
     .O_video_user  (axis_s_user),
     .O_video_valid (axis_s_valid),
@@ -1261,8 +1304,8 @@ startup_pulse #(
 //
 //  ★ 只静音、不停 SD 卡读取：这样拨回来是瞬间恢复，没有重新加载的延迟，
 //    代价仅仅是 SD 总线那 7% 的带宽（对图片轮播毫无影响）。
-wire [23:0] aud_left_out  = vcfg_music_en ? aud_left  : 24'd0;
-wire [23:0] aud_right_out = vcfg_music_en ? aud_right : 24'd0;
+//  ★ 门控后的信号 aud_left_out / aud_right_out 已提前到 audio_player 之后声明
+//    （audio_wave_osd 在字幕之后就要用，见上方注释）。
 
 // ===================== 带音频的 HDMI 1.4b 发射 =====================
 hdmi_1_4b_transmitter_core_wrapper #(
